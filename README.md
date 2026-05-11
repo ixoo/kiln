@@ -54,6 +54,7 @@ bind_address = "127.0.0.1:3000"
 
 The binary reads these environment variables:
 
+- `KILN_ENV_FILE`: optional path to an env file to load before reading other settings.
 - `KILN_CONFIG`: path to the TOML config file. Defaults to `config/kiln.toml`.
 - `KILN_GITHUB_APP_ID`: numeric GitHub App ID.
 - `KILN_GITHUB_WEBHOOK_SECRET`: webhook secret configured on the GitHub App.
@@ -70,9 +71,20 @@ https://<your-host>/webhooks/github
 
 The service expects GitHub `issue_comment` events. Non-actionable events return `200` with an ignored reason so GitHub does not retry them.
 
+Minimum tested GitHub App repository permissions for Milestone 1:
+
+- Checks: read and write.
+- Issues: read and write.
+- Pull requests: read and write.
+- Metadata: read-only.
+
+Subscribe the app to the `Issue comment` event. GitHub emits main pull request conversation comments as `issue_comment` events because pull requests are issues in GitHub's data model.
+
 ## Local GitHub Testing
 
 A tunnel is only needed if you want GitHub.com to send webhooks to a process running on your laptop. The default workflow avoids that by using simulated HTTP tests.
+
+See `docs/integration-testing.md` for the reusable manual GitHub App test setup.
 
 ## Current Non-Goals
 

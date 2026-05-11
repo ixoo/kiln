@@ -5,7 +5,11 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    if let Ok(env_file) = env::var("KILN_ENV_FILE") {
+        dotenvy::from_path(env_file).ok();
+    } else {
+        dotenvy::dotenv().ok();
+    }
     init_tracing();
 
     let config_path = env::var("KILN_CONFIG").unwrap_or_else(|_| "config/kiln.toml".to_string());

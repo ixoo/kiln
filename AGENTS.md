@@ -41,6 +41,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Use mocked HTTP fixture tests for local validation. Do not require a real GitHub App for normal test runs.
+Real GitHub App integration testing is documented in `docs/integration-testing.md`; keep all credentials and private keys out of git.
 
 ## CI and Releases
 
