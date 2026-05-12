@@ -5,8 +5,9 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use kiln::{
-    build_app, config::ServerSettings, github::run_marker, CheckRunRequest, GitHubClient,
-    GitHubContext, GitHubError, RepoPermission, RuntimeConfig, Settings,
+    build_app, config::ServerSettings, github::run_marker, AgentJob, CheckRunRequest,
+    DisabledJobLauncher, GitHubClient, GitHubContext, GitHubError, JobLaunchError, JobLaunchResult,
+    JobLauncher, RepoPermission, RuntimeConfig, Settings,
 };
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -29,6 +30,48 @@ struct MockState {
     existing_runs: HashSet<String>,
     comments: Vec<String>,
     checks: Vec<CheckRunRequest>,
+}
+
+#[derive(Clone)]
+struct RecordingLauncher {
+    jobs: Arc<Mutex<Vec<AgentJob>>>,
+    fail: bool,
+}
+
+impl RecordingLauncher {
+    fn new() -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        }
+    }
+
+    fn failing() -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        }
+    }
+
+    fn jobs(&self) -> Vec<AgentJob> {
+        self.jobs.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl JobLauncher for RecordingLauncher {
+    async fn launch(&self, job: AgentJob) -> Result<JobLaunchResult, JobLaunchError> {
+        self.jobs.lock().unwrap().push(job);
+
+        if self.fail {
+            return Err(JobLaunchError::Disabled);
+        }
+
+        Ok(JobLaunchResult {
+            status: "recorded".to_string(),
+            external_id: Some("job-recorded".to_string()),
+        })
+    }
 }
 
 impl MockGitHubClient {
@@ -125,6 +168,53 @@ async fn accepts_signed_pr_issue_comment_and_creates_comment_and_check() {
     assert!(comments[0].contains("Per-PR queue: `1`"));
     assert!(checks[0].external_id.starts_with("kiln_"));
     assert_eq!(checks[0].head_sha, "abc123");
+}
+
+#[tokio::test]
+async fn accepted_command_launches_agent_job() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let launcher = RecordingLauncher::new();
+    let app = app_with_launcher(github.clone(), launcher.clone());
+    let body = payload_with_body("/agent:coder:local fix tests");
+
+    let response = app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = response_json(response).await;
+    assert_eq!(response_body["runs"][0]["launch_status"], "recorded");
+
+    let jobs = launcher.jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].repo_full_name, "octo/repo");
+    assert_eq!(jobs[0].pr_number, 42);
+    assert_eq!(jobs[0].head_sha, "abc123");
+    assert_eq!(jobs[0].requester, "alice");
+    assert_eq!(jobs[0].command.agent.as_deref(), Some("coder"));
+    assert_eq!(jobs[0].command.model.as_deref(), Some("local"));
+}
+
+#[tokio::test]
+async fn launch_failure_is_reported_without_retrying_webhook() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let launcher = RecordingLauncher::failing();
+    let app = app_with_launcher(github.clone(), launcher);
+    let body = payload_with_body("/agent ping");
+
+    let response = app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = response_json(response).await;
+    assert_eq!(response_body["runs"][0]["launch_status"], "launch-failed");
+
+    let comments = github.comments();
+    assert_eq!(comments.len(), 2);
+    assert!(comments[1].contains("failed to launch the agent job"));
 }
 
 #[tokio::test]
@@ -289,12 +379,20 @@ async fn health_endpoint_returns_ok() {
 }
 
 fn app(github: MockGitHubClient) -> axum::Router {
+    app_with_launcher(github, DisabledJobLauncher)
+}
+
+fn app_with_launcher(
+    github: MockGitHubClient,
+    launcher: impl JobLauncher + 'static,
+) -> axum::Router {
     build_app(
         RuntimeConfig {
             settings: settings(),
             webhook_secret: "test-secret".to_string(),
         },
         Arc::new(github),
+        Arc::new(launcher),
     )
 }
 
@@ -303,6 +401,7 @@ fn settings() -> Settings {
         server: ServerSettings {
             bind_address: "127.0.0.1:3000".to_string(),
         },
+        execution: Default::default(),
     }
 }
 

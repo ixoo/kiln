@@ -1,7 +1,9 @@
 use crate::{
     command::{extract_commands, AgentCommand, CommandLine},
     config::RuntimeConfig,
+    execution::{AgentJob, JobLauncher, PerPrQueue},
     github::{run_marker, CheckRunRequest, GitHubClient, GitHubContext},
+    policy::{PolicyDecision, PolicyEngine},
     signature::verify_github_signature,
 };
 use axum::{
@@ -21,12 +23,22 @@ use tracing::{info, warn};
 struct AppState {
     config: Arc<RuntimeConfig>,
     github: Arc<dyn GitHubClient>,
+    launcher: Arc<dyn JobLauncher>,
+    queue: Arc<PerPrQueue>,
+    policy: PolicyEngine,
 }
 
-pub fn build_app(config: RuntimeConfig, github: Arc<dyn GitHubClient>) -> Router {
+pub fn build_app(
+    config: RuntimeConfig,
+    github: Arc<dyn GitHubClient>,
+    launcher: Arc<dyn JobLauncher>,
+) -> Router {
     let state = Arc::new(AppState {
         config: Arc::new(config),
         github,
+        launcher,
+        queue: Arc::new(PerPrQueue::default()),
+        policy: PolicyEngine,
     });
 
     Router::new()
@@ -181,14 +193,16 @@ async fn handle_command_line(
         );
     }
 
-    if !permission
-        .as_ref()
-        .is_some_and(|permission| permission.can_invoke_agent())
-    {
-        let reason = "requester must have write, maintain, or admin permission";
-        let body = rejection_comment(command.line_number, &command.raw, reason);
-        state.github.create_issue_comment(ctx, &body).await?;
-        return Ok(RunOutcome::rejected_command(command, reason));
+    match state.policy.evaluate_invocation(
+        permission.as_ref().expect("permission was fetched"),
+        command,
+    ) {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny(reason) => {
+            let body = rejection_comment(command.line_number, &command.raw, &reason);
+            state.github.create_issue_comment(ctx, &body).await?;
+            return Ok(RunOutcome::rejected_command(command, &reason));
+        }
     }
 
     if head_sha.is_none() {
@@ -208,7 +222,7 @@ async fn handle_command_line(
 
     let check = CheckRunRequest {
         name: format!("kiln/{} ({run_id})", agent_label(command)),
-        head_sha,
+        head_sha: head_sha.clone(),
         external_id: run_id.clone(),
         summary: format!(
             "Queued `{}` with agent `{}` and model `{}`. Per-PR queue position: {}.",
@@ -220,7 +234,32 @@ async fn handle_command_line(
     };
     state.github.create_check_run(ctx, check).await?;
 
-    Ok(RunOutcome::accepted(command, run_id, queue_position))
+    let job = AgentJob::new(
+        &run_id,
+        ctx,
+        head_sha,
+        &payload.sender.login,
+        command,
+        queue_position,
+    );
+    let queue_lock = state.queue.lock_for(&job.queue_key()).await;
+    let _guard = queue_lock.lock().await;
+    let launch_status = match state.launcher.launch(job).await {
+        Ok(result) => result.status,
+        Err(error) => {
+            warn!(%run_id, %error, "failed to launch agent job");
+            let body = launch_failure_comment(command, &run_id, &error.to_string());
+            state.github.create_issue_comment(ctx, &body).await?;
+            "launch-failed".to_string()
+        }
+    };
+
+    Ok(RunOutcome::accepted(
+        command,
+        run_id,
+        queue_position,
+        launch_status,
+    ))
 }
 
 fn ignored(reason: String) -> Response {
@@ -270,6 +309,16 @@ fn rejection_comment(line_number: usize, raw: &str, reason: &str) -> String {
     )
 }
 
+fn launch_failure_comment(command: &AgentCommand, run_id: &str, reason: &str) -> String {
+    format!(
+        "{}\nKiln accepted `{}` but failed to launch the agent job.\n\nRun: `{}`\nReason: {}.",
+        run_marker(run_id),
+        command.raw,
+        run_id,
+        reason
+    )
+}
+
 #[derive(Debug, Serialize)]
 struct WebhookResponse {
     status: String,
@@ -309,17 +358,25 @@ struct RunOutcome {
     line_number: usize,
     queue_position: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    launch_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
 
 impl RunOutcome {
-    fn accepted(command: &AgentCommand, run_id: String, queue_position: usize) -> Self {
+    fn accepted(
+        command: &AgentCommand,
+        run_id: String,
+        queue_position: usize,
+        launch_status: String,
+    ) -> Self {
         Self {
             status: "accepted".to_string(),
             run_id: Some(run_id),
             command: command.raw.clone(),
             line_number: command.line_number,
             queue_position,
+            launch_status: Some(launch_status),
             reason: None,
         }
     }
@@ -331,6 +388,7 @@ impl RunOutcome {
             command: command.raw.clone(),
             line_number: command.line_number,
             queue_position: command.command_index + 1,
+            launch_status: None,
             reason: Some("run already exists".to_string()),
         }
     }
@@ -342,6 +400,7 @@ impl RunOutcome {
             command: command_line.raw.clone(),
             line_number: command_line.line_number,
             queue_position: command_line.command_index + 1,
+            launch_status: None,
             reason: Some(reason.to_string()),
         }
     }
@@ -353,6 +412,7 @@ impl RunOutcome {
             command: command.raw.clone(),
             line_number: command.line_number,
             queue_position: command.command_index + 1,
+            launch_status: None,
             reason: Some(reason.to_string()),
         }
     }

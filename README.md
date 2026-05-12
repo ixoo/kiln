@@ -1,18 +1,23 @@
 # Kiln
 
-Kiln is a Git-native agent orchestrator. The first milestone is a GitHub App webhook service that accepts `/agent` commands on pull request issue comments, validates policy, and acknowledges accepted work with a PR comment plus a Check Run.
+Kiln is a Git-native agent orchestrator. It accepts `/agent` commands on pull request issue comments, validates policy, acknowledges accepted work with a PR comment plus a Check Run, and can hand accepted runs to a Kubernetes Job launcher.
 
-## Milestone 1 Scope
+## Current Scope
 
 - `POST /webhooks/github` for GitHub webhook delivery.
 - `GET /healthz` for health checks.
 - GitHub webhook signature verification with `X-Hub-Signature-256`.
 - `/agent` command parsing from line-start commands only.
-- Opaque agent/model command metadata for the future agent harness.
+- Opaque agent/model command metadata for the agent harness.
 - Maintainer-level permission enforcement: `write`, `maintain`, or `admin`.
 - Deterministic `kiln_<hash>` run IDs for idempotency.
 - One Check Run per accepted command.
 - Per-PR queue ordering for multiple commands in one comment.
+- Optional `kubectl` Kubernetes Job launch mode.
+- Runtime detection helpers for `.devcontainer/devcontainer.json` versus fallback images.
+- Audit metadata helpers for future commit trailers.
+- Recovery helpers for missing/stale run classification.
+- Provider-neutral domain types for future provider support.
 - Local HTTP fixture tests with a mocked GitHub client.
 
 ## Commands
@@ -25,11 +30,11 @@ Supported forms:
 /agent:<agent>:<model> <task>
 ```
 
-Bare `/agent <task>` leaves agent and model selection to the future agent harness. Explicit agent/model values are preserved as opaque metadata, but Kiln does not validate them locally.
+Bare `/agent <task>` leaves agent and model selection to the agent harness. Explicit agent/model values are preserved as opaque metadata, but Kiln does not validate them locally.
 
 ## Local Development
 
-Milestone 1 does not require Docker, a devcontainer, or a webhook tunnel for the primary development workflow. Tests simulate signed GitHub webhook requests through the real Axum route and mock outbound GitHub API calls.
+Local development does not require Docker, Kubernetes, a devcontainer, or a webhook tunnel for the primary workflow. Tests simulate signed GitHub webhook requests through the real Axum route and mock outbound GitHub API calls.
 
 Run tests:
 
@@ -45,12 +50,20 @@ cp .env.example .env
 cargo run
 ```
 
-The TOML config currently contains only the bind address:
+The default TOML config acknowledges commands without launching runtime jobs:
 
 ```toml
 [server]
 bind_address = "127.0.0.1:3000"
+
+[execution]
+mode = "disabled"
+namespace = "default"
+job_image = "ghcr.io/ixoo/kiln-agent:latest"
+default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
 ```
+
+Set `[execution].mode` to `kubectl` only in an environment where the Kiln process can run `kubectl apply -f -` against the target cluster. The generated Job receives run metadata, repository/PR metadata, command text, opaque agent/model values, and the configured fallback runtime image as environment variables.
 
 The binary reads these environment variables:
 
@@ -71,7 +84,7 @@ https://<your-host>/webhooks/github
 
 The service expects GitHub `issue_comment` events. Non-actionable events return `200` with an ignored reason so GitHub does not retry them.
 
-Minimum tested GitHub App repository permissions for Milestone 1:
+Minimum tested GitHub App repository permissions:
 
 - Checks: read and write.
 - Issues: read and write.
@@ -86,12 +99,10 @@ A tunnel is only needed if you want GitHub.com to send webhooks to a process run
 
 See `docs/integration-testing.md` for the reusable manual GitHub App test setup.
 
-## Current Non-Goals
+## Current Boundaries
 
-- Kubernetes Job execution.
-- Devcontainer runtime execution.
-- Model routing and inference.
-- Commit-capable agent runtime.
+- The default execution mode is disabled; Kubernetes launch requires explicit config.
+- Kiln generates runtime job metadata, but the agent harness container is not implemented in this repository yet.
+- Kiln detects devcontainer intent in helper code, but does not run Devcontainer CLI itself.
+- Model routing and agent/model validation belong to the agent harness.
 - Database-backed state.
-
-Those belong to later milestones in `plan.md`.

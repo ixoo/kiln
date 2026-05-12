@@ -4,7 +4,9 @@ This repository is a new Rust service for a Git-native agent orchestrator.
 
 ## Current Focus
 
-Implement Milestone 1 only unless the user explicitly expands scope:
+The project now includes the GitHub App foundation plus milestone-spanning foundations for execution, policy, runtime detection, audit metadata, and provider-neutral domain types. Keep future changes small and explicit.
+
+Implemented core foundations:
 
 - GitHub App webhook foundation.
 - `/agent` command parsing.
@@ -12,8 +14,14 @@ Implement Milestone 1 only unless the user explicitly expands scope:
 - maintainer permission checks.
 - acknowledgement comments and Check Runs.
 - local simulated HTTP tests.
+- optional Kubernetes Job launch through `kubectl`.
+- per-PR in-memory launch serialization.
+- runtime detection helpers.
+- audit trailer helpers.
+- recovery helpers for missing/stale run classification.
+- provider-neutral domain types.
 
-Do not implement Kubernetes execution, devcontainer runtime support, model inference, commit pushing, or GitLab support yet.
+Do not implement Devcontainer CLI execution, model inference, commit pushing, or GitLab support unless explicitly requested.
 Do not add Kiln-owned model or agent catalogs. Agent and model values in `/agent:<agent>:<model>` are opaque metadata until an agent harness integration can validate them.
 
 ## Engineering Rules

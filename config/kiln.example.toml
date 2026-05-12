@@ -1,2 +1,11 @@
 [server]
 bind_address = "127.0.0.1:3000"
+
+[execution]
+# `disabled` acknowledges commands and creates Check Runs without launching runtime jobs.
+# Set to `kubectl` in an environment where kubectl can apply Jobs to the target cluster.
+mode = "disabled"
+namespace = "default"
+job_image = "ghcr.io/ixoo/kiln-agent:latest"
+default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
+# service_account_name = "kiln-agent"

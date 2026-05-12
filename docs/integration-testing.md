@@ -122,6 +122,12 @@ Create `~/.config/kiln-test/kiln.toml`:
 ```toml
 [server]
 bind_address = "127.0.0.1:3000"
+
+[execution]
+mode = "disabled"
+namespace = "default"
+job_image = "ghcr.io/ixoo/kiln-agent:latest"
+default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
 ```
 
 Create `~/.config/kiln-test/.env` with absolute paths:
