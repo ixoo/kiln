@@ -223,7 +223,8 @@ impl GitHubClient for RealGitHubClient {
     async fn run_exists(&self, ctx: &GitHubContext, run_id: &str) -> Result<bool, GitHubError> {
         let marker = run_marker(run_id);
 
-        for page in 1..=5 {
+        let mut page = 1;
+        loop {
             let path = format!(
                 "/repos/{}/{}/issues/{}/comments?per_page=100&page={page}",
                 ctx.owner, ctx.repo, ctx.pr_number
@@ -241,9 +242,9 @@ impl GitHubClient for RealGitHubClient {
             if comments.len() < 100 {
                 return Ok(false);
             }
-        }
 
-        Ok(false)
+            page += 1;
+        }
     }
 
     async fn create_issue_comment(

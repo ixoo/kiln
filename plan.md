@@ -1,170 +1,209 @@
 # Agent Orchestrator Implementation Plan
 
-# Milestone 1 — GitHub App Foundation
+This plan tracks implemented foundations separately from future runtime and agent-harness work. Kiln should remain a small, stateless GitHub-native orchestrator. GitHub is the source of truth; no database, queue, workflow engine, multi-agent orchestration, or Kiln-owned model/agent catalog is planned for the MVP.
 
-Goal:
-- receive webhook events
-- parse `/agent`
-- acknowledge command
+## Current Project Status
 
-Deliverables:
-- GitHub App
-- webhook endpoint
-- signature verification
-- command parser
-- status comment
-- GitHub Check Run support
+Implemented now:
+- GitHub App webhook receiver for `issue_comment.created` events on pull requests.
+- HMAC signature verification for `X-Hub-Signature-256`.
+- Line-start `/agent` command parsing.
+- Opaque agent/model metadata preservation from `/agent:<agent>:<model>`.
+- Maintainer-level invocation policy: requester must have `write`, `maintain`, or `admin` repository permission.
+- Deterministic `kiln_<hash>` run IDs for idempotency.
+- Acknowledgement comments with hidden run markers.
+- One queued GitHub Check Run per accepted command.
+- In-memory per-PR serialization around accepted command handling and job launch.
+- Optional `kubectl apply -f -` Kubernetes Job launcher.
+- Runtime detection helper for `.devcontainer/devcontainer.json` versus fallback image metadata.
+- Audit trailer helpers for future commit-capable agents.
+- Recovery classification helpers for missing/stale runs.
+- Provider-neutral domain types as a foundation only.
+- Local simulated HTTP tests with mocked GitHub API calls.
 
-Example:
-```text
-/agent ping
-```
+Not implemented in Kiln today:
+- Agent harness execution.
+- Repository clone/checkout inside a job.
+- Devcontainer CLI execution.
+- Model inference, model routing, or model authorization.
+- Commit creation or push-back to PR branches.
+- Lifecycle Check Run updates beyond the initial queued run.
+- Startup reconciliation, webhook redelivery automation, or comment scanning.
+- GitLab support.
 
-# Milestone 2 — Kubernetes Execution
+## Milestone 1: GitHub App Foundation
 
-Goal:
-- launch Kubernetes Job per command
+Status: Done.
 
-Deliverables:
-- Kubernetes Job launcher
-- in-memory concurrency control
-- isolated execution container
-- structured logs
+Delivered:
+- GitHub webhook endpoint.
+- Signature verification.
+- `/agent` command parser.
+- Permission checks through the GitHub API.
+- Acknowledgement comments.
+- GitHub Check Run creation.
+- Local webhook fixture tests.
 
-Execution flow:
-```text
-webhook
-  → orchestrator
-  → k8s job
-```
+Quality bar:
+- Keep GitHub API access behind the `GitHubClient` trait.
+- Keep deterministic run ID generation stable.
+- Preserve idempotency through hidden run markers and Check Run `external_id` metadata.
 
-# Milestone 3 — GitHub Runtime Integration
+## Milestone 2: Kubernetes Execution
 
-Goal:
-- clone repo
-- checkout PR branch
-- read PR context
+Status: Partial foundation.
 
-Deliverables:
-- GitHub installation token handling
-- checkout logic
-- PR metadata retrieval
+Delivered:
+- Optional `kubectl` launch mode.
+- Disabled launch mode for local development and default deployments.
+- Kubernetes Job manifest generation with run, repository, PR, command, requester, and runtime metadata environment variables.
+- In-memory per-PR serialization around run acceptance and launch.
 
-# Milestone 4 — Local Model Integration
+Remaining, when explicitly needed:
+- Define the agent harness container contract.
+- Decide how job logs are collected or linked from GitHub.
+- Add tests around concrete Kubernetes manifest compatibility if the manifest evolves.
 
-Goal:
-- support local Qwen inference
+Out of scope for now:
+- Building or publishing a Kiln-owned agent container image.
+- Adding Kubernetes controllers, queues, or workflow engines.
 
-Deliverables:
-- OpenAI-compatible model adapter
-- local vLLM endpoint support
-- model routing abstraction
+## Milestone 3: GitHub Runtime Integration
 
-Example:
-```text
-/agent:reviewer:qwen-3.6 review this PR
-```
+Status: Partial foundation.
 
-# Milestone 5 — Devcontainer Runtime
+Delivered:
+- GitHub App installation token handling.
+- PR head SHA retrieval for Check Runs and job metadata.
 
-Goal:
-- support repo-defined runtime
+Remaining, when the agent harness exists:
+- Clone repository in the runtime job.
+- Checkout the PR branch or head SHA.
+- Provide PR metadata and context to the harness.
+- Define failure reporting from the harness back to GitHub.
 
-Deliverables:
-- detect `.devcontainer/devcontainer.json`
-- launch devcontainer
-- fallback runtime image
+## Milestone 4: Agent Harness And Model Integration
 
-Execution:
-```text
-clone repo
-  → devcontainer up
-  → run agent inside runtime
-```
+Status: Future.
 
-# Milestone 6 — Commit-Capable Agents
+Kiln currently treats agent and model values as opaque metadata. It must not validate, route, or catalog agents/models until a harness integration defines that contract.
 
-Goal:
-- allow coding agents to commit back to PRs
+Future work, only when explicitly requested:
+- Agent harness invocation contract.
+- Model availability discovery through the harness.
+- Local or cloud model routing inside the harness, not inside Kiln.
+- Policy hooks based on harness-declared capabilities.
 
-Deliverables:
-- git commit support
-- commit trailers
-- push to PR branch
-- audit metadata
+## Milestone 5: Devcontainer Runtime
 
-Example trailers:
+Status: Future, with helper foundation only.
+
+Delivered:
+- Helper detection for `.devcontainer/devcontainer.json` as an actual file.
+- Fallback runtime image metadata in config and job environment.
+
+Remaining, when explicitly requested:
+- Run Devcontainer CLI in the job environment.
+- Define fallback behavior when a devcontainer exists but fails to start.
+- Decide what runtime image or host dependencies are required by the harness.
+
+Do not add Docker, Podman, or Devcontainer CLI execution to Kiln itself without an explicit request.
+
+## Milestone 6: Commit-Capable Agents
+
+Status: Future, with audit helper foundation only.
+
+Delivered:
+- Commit trailer rendering helpers.
+
+Remaining, when explicitly requested:
+- Commit creation in the agent harness.
+- Push-back to PR branches.
+- Branch protection and fork safety rules.
+- GitHub UX for pushed commits and final status.
+
+Example future trailers:
+
 ```text
 Agent-Run: kiln_xxx
 Requested-By: @user
-Command: /agent:coder:qwen-3.6
+Command: /agent:coder:qwen-3.6 fix tests
+Agent: coder
+Model: qwen-3.6
 ```
 
-# Milestone 7 — Recovery & Reconciliation
+## Milestone 7: Recovery And Reconciliation
 
-Goal:
-- recover from orchestrator downtime
+Status: Partial helper foundation.
 
-Deliverables:
-- webhook redelivery
-- scan recent comments
-- stale run detection
-- idempotency keys
+Delivered:
+- Missing-run classification helper.
+- Stale-run classification helper.
+- Idempotent run IDs and hidden comment markers.
 
-Recovery logic:
-```text
-GitHub = source of truth
-```
+Remaining, when needed:
+- Startup reconciliation loop.
+- Recent comment scanning.
+- Webhook redelivery guidance or automation.
+- Stale Check Run update behavior.
 
-# Milestone 8 — Policy Engine
+Constraint:
+- Reconciliation must use GitHub as the source of truth and must not introduce a database.
 
-Goal:
-- enforce permissions and runtime policies, using agent harness capabilities where agent/model validation is required
+## Milestone 8: Policy Engine
 
-Rules:
-- only maintainers can use cloud models
-- reviewer agents cannot commit
-- protected branches cannot be pushed to
+Status: Minimal implemented policy.
 
-# Milestone 9 — Git Provider Abstraction
+Delivered:
+- Requester must have `write`, `maintain`, or `admin` permission.
 
-Goal:
-- prepare for GitLab support
+Future policy hooks, only after a harness contract exists:
+- Commit-capability checks declared by the harness.
+- Model availability or model class restrictions declared by the harness.
+- Protected branch and fork push safety rules for commit-capable agents.
 
-Deliverables:
-- provider interface
-- GitHubProvider
-- provider-neutral domain model
+Do not add Kiln-owned model aliases, agent catalogs, or hardcoded reviewer/coder behavior.
 
-# Suggested Tech Stack
+## Milestone 9: Git Provider Abstraction
 
-Language:
-- Rust
+Status: Foundation only.
 
-Infrastructure:
-- Kubernetes
-- GitHub App
-- Devcontainer CLI
+Delivered:
+- Provider-neutral domain types such as `ChangeRequest`, `RunStatus`, `CodeComment`, `ProviderUser`, and `ProviderToken`.
 
-Inference:
-- vLLM
-- OpenAI-compatible APIs
+Future work, only when explicitly requested:
+- A provider trait separate from `GitHubClient`.
+- A concrete GitHub provider implementation over that trait.
+- GitLab support.
 
-Container Runtime:
-- Docker or Podman
+## Current Tech Stack
 
-# MVP Constraints
+Implemented:
+- Rust.
+- Axum.
+- GitHub App APIs.
+- Optional `kubectl` process invocation.
+
+Possible future stack, not implemented today:
+- Devcontainer CLI.
+- Agent harness container.
+- Local OpenAI-compatible model endpoints.
+- Cloud model endpoints owned by the harness configuration.
+
+## MVP Constraints
 
 Avoid:
-- databases
-- Kafka
-- Temporal
-- workflow engines
-- multi-agent orchestration
-- memory systems
+- Databases.
+- Kafka.
+- Temporal.
+- Workflow engines.
+- Multi-agent orchestration.
+- Memory systems.
+- Kiln-owned model or agent catalogs.
 
 Focus on:
-- simplicity
-- auditability
-- reproducibility
-- GitHub-native workflows
+- Simplicity.
+- Auditability.
+- Reproducibility.
+- GitHub-native workflows.
+- Small explicit modules and mocked local tests.

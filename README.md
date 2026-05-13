@@ -12,7 +12,7 @@ Kiln is a Git-native agent orchestrator. It accepts `/agent` commands on pull re
 - Maintainer-level permission enforcement: `write`, `maintain`, or `admin`.
 - Deterministic `kiln_<hash>` run IDs for idempotency.
 - One Check Run per accepted command.
-- Per-PR queue ordering for multiple commands in one comment.
+- In-memory per-PR serialization around accepted command handling and job launch.
 - Optional `kubectl` Kubernetes Job launch mode.
 - Runtime detection helpers for `.devcontainer/devcontainer.json` versus fallback images.
 - Audit metadata helpers for future commit trailers.
@@ -63,7 +63,7 @@ job_image = "ghcr.io/ixoo/kiln-agent:latest"
 default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
 ```
 
-Set `[execution].mode` to `kubectl` only in an environment where the Kiln process can run `kubectl apply -f -` against the target cluster. The generated Job receives run metadata, repository/PR metadata, command text, opaque agent/model values, and the configured fallback runtime image as environment variables.
+Set `[execution].mode` to `kubectl` only in an environment where the Kiln process can run `kubectl apply -f -` against the target cluster. Unknown execution modes fail startup. The generated Job receives run metadata, repository/PR metadata, command text, opaque agent/model values, and the configured fallback runtime image as environment variables.
 
 The binary reads these environment variables:
 
@@ -105,4 +105,4 @@ See `docs/integration-testing.md` for the reusable manual GitHub App test setup.
 - Kiln generates runtime job metadata, but the agent harness container is not implemented in this repository yet.
 - Kiln detects devcontainer intent in helper code, but does not run Devcontainer CLI itself.
 - Model routing and agent/model validation belong to the agent harness.
-- Database-backed state.
+- Database-backed state is intentionally out of scope; GitHub remains the source of truth.

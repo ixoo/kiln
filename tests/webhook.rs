@@ -241,6 +241,24 @@ async fn duplicate_delivery_is_idempotent() {
 }
 
 #[tokio::test]
+async fn concurrent_duplicate_delivery_is_idempotent() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let app = app(github.clone());
+    let body = payload_with_body("/agent fix tests");
+
+    let (first, second) = tokio::join!(
+        app.clone()
+            .oneshot(signed_request("issue_comment", &body, "test-secret")),
+        app.oneshot(signed_request("issue_comment", &body, "test-secret")),
+    );
+
+    assert_eq!(first.unwrap().status(), StatusCode::OK);
+    assert_eq!(second.unwrap().status(), StatusCode::OK);
+    assert_eq!(github.comments().len(), 1);
+    assert_eq!(github.checks().len(), 1);
+}
+
+#[tokio::test]
 async fn multiple_commands_are_queued_per_pr_in_order() {
     let github = MockGitHubClient::new(RepoPermission::Write);
     let app = app(github.clone());
@@ -298,6 +316,24 @@ async fn malformed_command_gets_rejection_comment_without_check() {
     assert_eq!(github.comments().len(), 1);
     assert_eq!(github.checks().len(), 0);
     assert!(github.comments()[0].contains("could not accept command"));
+}
+
+#[tokio::test]
+async fn ignores_non_command_agent_prefix_words() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let app = app(github.clone());
+    let body = payload_with_body("/agentic please review\n/agents please review");
+
+    let response = app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = response_json(response).await;
+    assert_eq!(response_body["status"], "ignored");
+    assert_eq!(github.comments().len(), 0);
+    assert_eq!(github.checks().len(), 0);
 }
 
 #[tokio::test]

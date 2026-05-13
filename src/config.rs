@@ -51,13 +51,29 @@ pub enum ConfigError {
     Read(#[from] std::io::Error),
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("unsupported execution mode `{0}`; expected `disabled` or `kubectl`")]
+    InvalidExecutionMode(String),
 }
 
 impl Settings {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
         let settings = toml::from_str::<Settings>(&raw)?;
+        settings.validate()?;
         Ok(settings)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.execution.validate()
+    }
+}
+
+impl ExecutionSettings {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self.mode.as_str() {
+            "disabled" | "kubectl" => Ok(()),
+            other => Err(ConfigError::InvalidExecutionMode(other.to_string())),
+        }
     }
 }
 
@@ -75,4 +91,27 @@ fn default_job_image() -> String {
 
 fn default_runtime_image() -> String {
     "ghcr.io/devcontainers/base:ubuntu".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_execution_mode() {
+        let settings = Settings {
+            server: ServerSettings {
+                bind_address: "127.0.0.1:3000".to_string(),
+            },
+            execution: ExecutionSettings {
+                mode: "kubeclt".to_string(),
+                ..Default::default()
+            },
+        };
+
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigError::InvalidExecutionMode(mode)) if mode == "kubeclt"
+        ));
+    }
 }

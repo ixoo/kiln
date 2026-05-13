@@ -1,7 +1,7 @@
 use crate::{
     command::{extract_commands, AgentCommand, CommandLine},
     config::RuntimeConfig,
-    execution::{AgentJob, JobLauncher, PerPrQueue},
+    execution::{queue_key, AgentJob, JobLauncher, PerPrQueue},
     github::{run_marker, CheckRunRequest, GitHubClient, GitHubContext},
     policy::{PolicyDecision, PolicyEngine},
     signature::verify_github_signature,
@@ -178,88 +178,98 @@ async fn handle_command_line(
         }
     };
 
-    let run_id = run_id(ctx, payload.comment.id, command);
-    if state.github.run_exists(ctx, &run_id).await? {
-        info!(%run_id, "skipping duplicate agent command");
-        return Ok(RunOutcome::duplicate(command, run_id));
-    }
+    let queue_key = queue_key(&ctx.repo_full_name, ctx.pr_number);
+    let queue_lock = state.queue.lock_for(&queue_key).await;
+    let queue_guard = queue_lock.lock().await;
 
-    if permission.is_none() {
-        *permission = Some(
-            state
-                .github
-                .user_permission(ctx, &payload.sender.login)
-                .await?,
+    let outcome = async {
+        let run_id = run_id(ctx, payload.comment.id, command);
+        if state.github.run_exists(ctx, &run_id).await? {
+            info!(%run_id, "skipping duplicate agent command");
+            return Ok(RunOutcome::duplicate(command, run_id));
+        }
+
+        if permission.is_none() {
+            *permission = Some(
+                state
+                    .github
+                    .user_permission(ctx, &payload.sender.login)
+                    .await?,
+            );
+        }
+
+        match state.policy.evaluate_invocation(
+            permission.as_ref().expect("permission was fetched"),
+            command,
+        ) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny(reason) => {
+                let body = rejection_comment(command.line_number, &command.raw, &reason);
+                state.github.create_issue_comment(ctx, &body).await?;
+                return Ok(RunOutcome::rejected_command(command, &reason));
+            }
+        }
+
+        if head_sha.is_none() {
+            *head_sha = Some(state.github.pull_request_head_sha(ctx).await?);
+        }
+
+        let queue_position = command.command_index + 1;
+        let head_sha = head_sha
+            .as_ref()
+            .expect("head sha was just fetched")
+            .clone();
+        let acknowledgement = acknowledgement_comment(command, &run_id, queue_position);
+        state
+            .github
+            .create_issue_comment(ctx, &acknowledgement)
+            .await?;
+
+        let check = CheckRunRequest {
+            name: format!("kiln/{} ({run_id})", agent_label(command)),
+            head_sha: head_sha.clone(),
+            external_id: run_id.clone(),
+            summary: format!(
+                "Queued `{}` with agent `{}` and model `{}`. Per-PR queue position: {}.",
+                command.raw,
+                agent_label(command),
+                model_label(command),
+                queue_position
+            ),
+        };
+        state.github.create_check_run(ctx, check).await?;
+
+        let job = AgentJob::new(
+            &run_id,
+            ctx,
+            head_sha,
+            &payload.sender.login,
+            command,
+            queue_position,
         );
+        let launch_status = match state.launcher.launch(job).await {
+            Ok(result) => result.status,
+            Err(error) => {
+                warn!(%run_id, %error, "failed to launch agent job");
+                let body = launch_failure_comment(command, &run_id, &error.to_string());
+                state.github.create_issue_comment(ctx, &body).await?;
+                "launch-failed".to_string()
+            }
+        };
+
+        Ok(RunOutcome::accepted(
+            command,
+            run_id,
+            queue_position,
+            launch_status,
+        ))
     }
+    .await;
 
-    match state.policy.evaluate_invocation(
-        permission.as_ref().expect("permission was fetched"),
-        command,
-    ) {
-        PolicyDecision::Allow => {}
-        PolicyDecision::Deny(reason) => {
-            let body = rejection_comment(command.line_number, &command.raw, &reason);
-            state.github.create_issue_comment(ctx, &body).await?;
-            return Ok(RunOutcome::rejected_command(command, &reason));
-        }
-    }
+    drop(queue_guard);
+    state.queue.release_if_idle(&queue_key, &queue_lock).await;
 
-    if head_sha.is_none() {
-        *head_sha = Some(state.github.pull_request_head_sha(ctx).await?);
-    }
-
-    let queue_position = command.command_index + 1;
-    let head_sha = head_sha
-        .as_ref()
-        .expect("head sha was just fetched")
-        .clone();
-    let acknowledgement = acknowledgement_comment(command, &run_id, queue_position);
-    state
-        .github
-        .create_issue_comment(ctx, &acknowledgement)
-        .await?;
-
-    let check = CheckRunRequest {
-        name: format!("kiln/{} ({run_id})", agent_label(command)),
-        head_sha: head_sha.clone(),
-        external_id: run_id.clone(),
-        summary: format!(
-            "Queued `{}` with agent `{}` and model `{}`. Per-PR queue position: {}.",
-            command.raw,
-            agent_label(command),
-            model_label(command),
-            queue_position
-        ),
-    };
-    state.github.create_check_run(ctx, check).await?;
-
-    let job = AgentJob::new(
-        &run_id,
-        ctx,
-        head_sha,
-        &payload.sender.login,
-        command,
-        queue_position,
-    );
-    let queue_lock = state.queue.lock_for(&job.queue_key()).await;
-    let _guard = queue_lock.lock().await;
-    let launch_status = match state.launcher.launch(job).await {
-        Ok(result) => result.status,
-        Err(error) => {
-            warn!(%run_id, %error, "failed to launch agent job");
-            let body = launch_failure_comment(command, &run_id, &error.to_string());
-            state.github.create_issue_comment(ctx, &body).await?;
-            "launch-failed".to_string()
-        }
-    };
-
-    Ok(RunOutcome::accepted(
-        command,
-        run_id,
-        queue_position,
-        launch_status,
-    ))
+    outcome
 }
 
 fn ignored(reason: String) -> Response {

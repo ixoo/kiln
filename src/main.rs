@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let private_key_path = env::var("KILN_GITHUB_PRIVATE_KEY_PATH")?;
 
     let github = Arc::new(RealGitHubClient::new(app_id, private_key_path)?);
-    let launcher = launcher_from_settings(&settings.execution);
+    let launcher = launcher_from_settings(&settings.execution)?;
     let app = build_app(
         RuntimeConfig {
             settings,

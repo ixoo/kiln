@@ -1,4 +1,8 @@
-use crate::{command::AgentCommand, config::ExecutionSettings, github::GitHubContext};
+use crate::{
+    command::AgentCommand,
+    config::{ConfigError, ExecutionSettings},
+    github::GitHubContext,
+};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::{
@@ -41,8 +45,12 @@ impl AgentJob {
     }
 
     pub fn queue_key(&self) -> String {
-        format!("{}#{}", self.repo_full_name, self.pr_number)
+        queue_key(&self.repo_full_name, self.pr_number)
     }
+}
+
+pub fn queue_key(repo_full_name: &str, pr_number: u64) -> String {
+    format!("{repo_full_name}#{pr_number}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +154,17 @@ impl PerPrQueue {
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    pub async fn release_if_idle(&self, key: &str, lock: &Arc<Mutex<()>>) {
+        let mut locks = self.locks.lock().await;
+
+        if locks
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, lock) && Arc::strong_count(lock) == 2)
+        {
+            locks.remove(key);
+        }
     }
 }
 
@@ -279,10 +298,15 @@ fn kubernetes_job_name(run_id: &str) -> String {
     run_id.replace('_', "-")
 }
 
-pub fn launcher_from_settings(settings: &ExecutionSettings) -> Arc<dyn JobLauncher> {
+pub fn launcher_from_settings(
+    settings: &ExecutionSettings,
+) -> Result<Arc<dyn JobLauncher>, ConfigError> {
+    settings.validate()?;
+
     match settings.mode.as_str() {
-        "kubectl" => Arc::new(KubectlJobLauncher::new(settings.clone())),
-        _ => Arc::new(DisabledJobLauncher),
+        "disabled" => Ok(Arc::new(DisabledJobLauncher)),
+        "kubectl" => Ok(Arc::new(KubectlJobLauncher::new(settings.clone()))),
+        _ => unreachable!("execution mode was validated"),
     }
 }
 
@@ -335,5 +359,17 @@ mod tests {
 
         assert_eq!(result.status, "launch-disabled");
         assert_eq!(result.external_id, None);
+    }
+
+    #[tokio::test]
+    async fn removes_idle_pr_locks() {
+        let queue = PerPrQueue::default();
+        let key = "octo/repo#42";
+        let lock = queue.lock_for(key).await;
+
+        queue.release_if_idle(key, &lock).await;
+
+        let next_lock = queue.lock_for(key).await;
+        assert!(!Arc::ptr_eq(&lock, &next_lock));
     }
 }

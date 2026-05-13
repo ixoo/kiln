@@ -178,6 +178,8 @@ curl https://<generated-host>/healthz
 gh pr comment <pr-number> --repo <owner>/<repo> --body "/agent ping"
 ```
 
+The GitHub user posting the command must have `write`, `maintain`, or `admin` permission on the test repository. Lower permissions produce a rejection comment instead of a Check Run.
+
 6. Confirm the expected result:
 
 - The GitHub App bot posts an acknowledgement comment.

@@ -20,7 +20,7 @@ pub fn extract_commands(body: &str) -> Vec<CommandLine> {
     let mut commands = Vec::new();
 
     for (line_idx, line) in body.lines().enumerate() {
-        if !line.starts_with("/agent") {
+        if !is_agent_command_line(line) {
             continue;
         }
 
@@ -38,6 +38,18 @@ pub fn extract_commands(body: &str) -> Vec<CommandLine> {
     }
 
     commands
+}
+
+fn is_agent_command_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("/agent") else {
+        return false;
+    };
+
+    rest.is_empty()
+        || rest
+            .chars()
+            .next()
+            .is_some_and(|character| character == ':' || character.is_whitespace())
 }
 
 fn parse_command_line(
@@ -112,5 +124,15 @@ mod tests {
         let command = commands[0].parsed.as_ref().unwrap();
         assert_eq!(command.agent.as_deref(), Some("coder"));
         assert_eq!(command.model.as_deref(), Some("gpt-5.5-high"));
+    }
+
+    #[test]
+    fn ignores_words_that_only_start_with_agent_prefix() {
+        let commands =
+            extract_commands("/agentic no\n/agents no\n/agent ping\n/agent:reviewer review");
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].raw, "/agent ping");
+        assert_eq!(commands[1].raw, "/agent:reviewer review");
     }
 }

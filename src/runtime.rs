@@ -20,7 +20,7 @@ pub fn detect_repo_runtime(
     default_image: impl Into<String>,
 ) -> RuntimePlan {
     let devcontainer = repo_path.as_ref().join(".devcontainer/devcontainer.json");
-    if devcontainer.exists() {
+    if devcontainer.is_file() {
         RuntimePlan::Devcontainer
     } else {
         RuntimePlan::DefaultImage(default_image.into())
@@ -52,6 +52,19 @@ mod tests {
         assert_eq!(
             detect_repo_runtime(temp.path(), "ghcr.io/example/runtime:latest"),
             RuntimePlan::DefaultImage("ghcr.io/example/runtime:latest".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_devcontainer_json_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let devcontainer_dir = temp.path().join(".devcontainer");
+        fs::create_dir(&devcontainer_dir).unwrap();
+        fs::create_dir(devcontainer_dir.join("devcontainer.json")).unwrap();
+
+        assert_eq!(
+            detect_repo_runtime(temp.path(), "fallback"),
+            RuntimePlan::DefaultImage("fallback".to_string())
         );
     }
 }
