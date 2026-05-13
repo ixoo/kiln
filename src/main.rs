@@ -15,9 +15,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let config_path = env::var("KILN_CONFIG").unwrap_or_else(|_| "config/kiln.toml".to_string());
-    let settings = Settings::load(config_path)?;
+    let mut settings = Settings::load(config_path)?;
     let bind_address = settings.server.bind_address.parse::<SocketAddr>()?;
     let webhook_secret = env::var("KILN_GITHUB_WEBHOOK_SECRET")?;
+    let agent_callback_secret = env::var("KILN_AGENT_CALLBACK_SECRET").ok();
+    settings.execution.callback_secret = agent_callback_secret.clone();
     let app_id = env::var("KILN_GITHUB_APP_ID")?.parse::<u64>()?;
     let private_key_path = env::var("KILN_GITHUB_PRIVATE_KEY_PATH")?;
 
@@ -27,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RuntimeConfig {
             settings,
             webhook_secret,
+            agent_callback_secret,
         },
         github,
         launcher,

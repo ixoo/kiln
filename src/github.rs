@@ -3,10 +3,14 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::Path,
+    sync::Arc,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoPermission {
@@ -52,6 +56,22 @@ pub struct CheckRunRequest {
     pub summary: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CheckRunUpdate {
+    pub external_id: String,
+    pub head_sha: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueComment {
+    pub id: u64,
+    pub body: String,
+    pub trusted: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitHubError {
     #[error("github request failed: {0}")]
@@ -79,7 +99,14 @@ pub trait GitHubClient: Send + Sync {
 
     async fn pull_request_head_sha(&self, ctx: &GitHubContext) -> Result<String, GitHubError>;
 
-    async fn run_exists(&self, ctx: &GitHubContext, run_id: &str) -> Result<bool, GitHubError>;
+    async fn check_run_exists(
+        &self,
+        ctx: &GitHubContext,
+        head_sha: &str,
+        external_id: &str,
+    ) -> Result<bool, GitHubError>;
+
+    async fn issue_comments(&self, ctx: &GitHubContext) -> Result<Vec<IssueComment>, GitHubError>;
 
     async fn create_issue_comment(
         &self,
@@ -92,6 +119,12 @@ pub trait GitHubClient: Send + Sync {
         ctx: &GitHubContext,
         request: CheckRunRequest,
     ) -> Result<(), GitHubError>;
+
+    async fn update_check_run(
+        &self,
+        ctx: &GitHubContext,
+        update: CheckRunUpdate,
+    ) -> Result<(), GitHubError>;
 }
 
 pub fn run_marker(run_id: &str) -> String {
@@ -103,6 +136,7 @@ pub struct RealGitHubClient {
     private_key: EncodingKey,
     http: reqwest::Client,
     api_base_url: String,
+    token_cache: Arc<Mutex<HashMap<u64, CachedInstallationToken>>>,
 }
 
 impl RealGitHubClient {
@@ -113,8 +147,12 @@ impl RealGitHubClient {
         Ok(Self {
             app_id,
             private_key,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()?,
             api_base_url: "https://api.github.com".to_string(),
+            token_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -138,6 +176,13 @@ impl RealGitHubClient {
     }
 
     async fn installation_token(&self, installation_id: u64) -> Result<String, GitHubError> {
+        let now = unix_now()?;
+        if let Some(token) = self.token_cache.lock().await.get(&installation_id) {
+            if token.expires_at_unix > now + 60 {
+                return Ok(token.token.clone());
+            }
+        }
+
         let url = format!(
             "{}/app/installations/{installation_id}/access_tokens",
             self.api_base_url
@@ -155,7 +200,15 @@ impl RealGitHubClient {
 
         let response = ensure_success(response).await?;
         let token = response.json::<InstallationToken>().await?;
-        Ok(token.token)
+        let token_value = token.token;
+        self.token_cache.lock().await.insert(
+            installation_id,
+            CachedInstallationToken {
+                token: token_value.clone(),
+                expires_at_unix: now + 3000,
+            },
+        );
+        Ok(token_value)
     }
 
     async fn get_with_installation_token(
@@ -195,6 +248,46 @@ impl RealGitHubClient {
 
         ensure_success(response).await
     }
+
+    async fn patch_with_installation_token<T: Serialize + ?Sized>(
+        &self,
+        ctx: &GitHubContext,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::Response, GitHubError> {
+        let token = self.installation_token(ctx.installation_id).await?;
+        let response = self
+            .http
+            .patch(format!("{}{}", self.api_base_url, path))
+            .header(USER_AGENT, "kiln")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .json(body)
+            .send()
+            .await?;
+
+        ensure_success(response).await
+    }
+
+    async fn find_check_run_id(
+        &self,
+        ctx: &GitHubContext,
+        head_sha: &str,
+        external_id: &str,
+    ) -> Result<Option<u64>, GitHubError> {
+        let path = format!(
+            "/repos/{}/{}/commits/{}/check-runs?per_page=100",
+            ctx.owner, ctx.repo, head_sha
+        );
+        let response = self.get_with_installation_token(ctx, &path).await?;
+        let response = response.json::<CheckRunsResponse>().await?;
+
+        Ok(response
+            .check_runs
+            .into_iter()
+            .find(|check| check.external_id.as_deref() == Some(external_id))
+            .map(|check| check.id))
+    }
 }
 
 #[async_trait]
@@ -208,7 +301,19 @@ impl GitHubClient for RealGitHubClient {
             "/repos/{}/{}/collaborators/{username}/permission",
             ctx.owner, ctx.repo
         );
-        let response = self.get_with_installation_token(ctx, &path).await?;
+        let token = self.installation_token(ctx.installation_id).await?;
+        let response = self
+            .http
+            .get(format!("{}{}", self.api_base_url, path))
+            .header(USER_AGENT, "kiln")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(RepoPermission::Read);
+        }
+        let response = ensure_success(response).await?;
         let permission = response.json::<PermissionResponse>().await?;
         Ok(RepoPermission::from_github(permission.permission))
     }
@@ -220,8 +325,20 @@ impl GitHubClient for RealGitHubClient {
         Ok(pull.head.sha)
     }
 
-    async fn run_exists(&self, ctx: &GitHubContext, run_id: &str) -> Result<bool, GitHubError> {
-        let marker = run_marker(run_id);
+    async fn check_run_exists(
+        &self,
+        ctx: &GitHubContext,
+        head_sha: &str,
+        external_id: &str,
+    ) -> Result<bool, GitHubError> {
+        Ok(self
+            .find_check_run_id(ctx, head_sha, external_id)
+            .await?
+            .is_some())
+    }
+
+    async fn issue_comments(&self, ctx: &GitHubContext) -> Result<Vec<IssueComment>, GitHubError> {
+        let mut all_comments = Vec::new();
 
         let mut page = 1;
         loop {
@@ -232,15 +349,19 @@ impl GitHubClient for RealGitHubClient {
             let response = self.get_with_installation_token(ctx, &path).await?;
             let comments = response.json::<Vec<IssueCommentResponse>>().await?;
 
-            if comments
-                .iter()
-                .any(|comment| comment.body.contains(&marker))
-            {
-                return Ok(true);
-            }
+            all_comments.extend(comments.iter().map(|comment| {
+                IssueComment {
+                    id: comment.id,
+                    body: comment.body.clone(),
+                    trusted: comment
+                        .performed_via_github_app
+                        .as_ref()
+                        .is_some_and(|app| app.id == self.app_id),
+                }
+            }));
 
             if comments.len() < 100 {
-                return Ok(false);
+                return Ok(all_comments);
             }
 
             page += 1;
@@ -280,6 +401,42 @@ impl GitHubClient for RealGitHubClient {
         self.post_with_installation_token(ctx, &path, &body).await?;
         Ok(())
     }
+
+    async fn update_check_run(
+        &self,
+        ctx: &GitHubContext,
+        update: CheckRunUpdate,
+    ) -> Result<(), GitHubError> {
+        let Some(check_run_id) = self
+            .find_check_run_id(ctx, &update.head_sha, &update.external_id)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let path = format!(
+            "/repos/{}/{}/check-runs/{check_run_id}",
+            ctx.owner, ctx.repo
+        );
+        let body = UpdateCheckRunBody {
+            status: &update.status,
+            conclusion: update.conclusion.as_deref(),
+            output: CheckRunOutput {
+                title: "Kiln agent run",
+                summary: &update.summary,
+            },
+        };
+        self.patch_with_installation_token(ctx, &path, &body)
+            .await?;
+        Ok(())
+    }
+}
+
+fn unix_now() -> Result<u64, GitHubError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| GitHubError::Clock)?
+        .as_secs())
 }
 
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, GitHubError> {
@@ -307,6 +464,12 @@ struct InstallationToken {
     token: String,
 }
 
+#[derive(Debug, Clone)]
+struct CachedInstallationToken {
+    token: String,
+    expires_at_unix: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct PermissionResponse {
     permission: String,
@@ -324,7 +487,15 @@ struct PullRequestHead {
 
 #[derive(Debug, Deserialize)]
 struct IssueCommentResponse {
+    id: u64,
     body: String,
+    #[serde(default)]
+    performed_via_github_app: Option<GitHubAppResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAppResponse {
+    id: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,7 +513,26 @@ struct CreateCheckRunBody<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct UpdateCheckRunBody<'a> {
+    status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conclusion: Option<&'a str>,
+    output: CheckRunOutput<'a>,
+}
+
+#[derive(Debug, Serialize)]
 struct CheckRunOutput<'a> {
     title: &'a str,
     summary: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunsResponse {
+    check_runs: Vec<CheckRunResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunResponse {
+    id: u64,
+    external_id: Option<String>,
 }

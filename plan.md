@@ -12,9 +12,13 @@ Implemented now:
 - Maintainer-level invocation policy: requester must have `write`, `maintain`, or `admin` repository permission.
 - Deterministic `kiln_<hash>` run IDs for idempotency.
 - Acknowledgement comments with hidden run markers.
+- Hidden run-state metadata in PR comments for GitHub-backed queue reconstruction.
 - One queued GitHub Check Run per accepted command.
-- In-memory per-PR serialization around accepted command handling and job launch.
+- Authenticated agent completion callback endpoint.
+- In-memory per-PR critical sections only to prevent same-process launch races.
+- Optional local process launcher with no isolation.
 - Optional `kubectl apply -f -` Kubernetes Job launcher.
+- Per-run callback tokens derived from Kiln's private callback key.
 - Runtime detection helper for `.devcontainer/devcontainer.json` versus fallback image metadata.
 - Audit trailer helpers for future commit-capable agents.
 - Recovery classification helpers for missing/stale runs.
@@ -22,7 +26,7 @@ Implemented now:
 - Local simulated HTTP tests with mocked GitHub API calls.
 
 Not implemented in Kiln today:
-- Agent harness execution.
+- A complete agent harness.
 - Repository clone/checkout inside a job.
 - Devcontainer CLI execution.
 - Model inference, model routing, or model authorization.
@@ -54,10 +58,14 @@ Quality bar:
 Status: Partial foundation.
 
 Delivered:
+- Local host process launch mode for simple trusted deployments.
 - Optional `kubectl` launch mode.
 - Disabled launch mode for local development and default deployments.
 - Kubernetes Job manifest generation with run, repository, PR, command, requester, and runtime metadata environment variables.
-- In-memory per-PR serialization around run acceptance and launch.
+- GitHub-backed queue state from hidden PR comment metadata.
+- Agent completion callbacks that mark asynchronous runs completed or failed and advance queued work.
+- Per-run callback tokens are passed to jobs instead of the private callback key.
+- In-memory per-PR critical sections for race prevention, not durable queue state.
 
 Remaining, when explicitly needed:
 - Define the agent harness container contract.
@@ -67,6 +75,9 @@ Remaining, when explicitly needed:
 Out of scope for now:
 - Building or publishing a Kiln-owned agent container image.
 - Adding Kubernetes controllers, queues, or workflow engines.
+
+Local execution warning:
+- `local` mode runs with the Kiln process user's host permissions and provides no sandbox. It must be used only for development or trusted deployments.
 
 ## Milestone 3: GitHub Runtime Integration
 

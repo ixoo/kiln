@@ -12,7 +12,7 @@ Kiln reacts to PR comments such as:
 /agent:coder:qwen-3.6 fix this bug
 ```
 
-Today, Kiln validates and acknowledges accepted commands, creates queued Check Runs, and can optionally launch a Kubernetes Job through `kubectl`. The agent harness, repository checkout, devcontainer execution, model inference, and commit push-back are future integrations and are not implemented in this repository.
+Today, Kiln validates and acknowledges accepted commands, creates queued Check Runs, reconstructs per-PR queue state from GitHub comments, can launch work locally or through `kubectl`, and accepts authenticated agent completion callbacks. The agent harness, repository checkout, devcontainer execution, model inference, and commit push-back are future integrations and are not implemented in this repository.
 
 ## Core Principles
 
@@ -20,7 +20,8 @@ Today, Kiln validates and acknowledges accepted commands, creates queued Check R
 - No database is required for the MVP.
 - The orchestrator is stateless and recoverable.
 - GitHub API calls stay behind the `GitHubClient` trait.
-- Kubernetes execution is optional and configured explicitly.
+- Local execution is available for simple trusted deployments, but has no isolation.
+- Kubernetes execution is optional and configured explicitly for stronger isolation.
 - Agent and model strings are opaque metadata until a harness validates them.
 - Every accepted run has stable audit metadata.
 - Keep the orchestrator simple.
@@ -35,7 +36,10 @@ GitHub App
   -> permission policy
   -> acknowledgement comment
   -> queued Check Run
+  -> GitHub-backed queue scan
+  -> optional local process launch
   -> optional kubectl Job launch
+  -> authenticated completion callback
 ```
 
 ## Target Architecture
@@ -64,7 +68,9 @@ Implemented responsibilities:
 - Reject malformed commands with a comment.
 - Enforce maintainer-level invocation permission.
 - Create acknowledgement comments and queued Check Runs.
-- Optionally launch Kubernetes Jobs.
+- Reconstruct queued/running/completed/failed run state from hidden PR comment metadata.
+- Optionally launch local processes or Kubernetes Jobs.
+- Accept authenticated agent callbacks to mark asynchronous runs completed or failed and advance queued work.
 
 ### Command Parser
 
@@ -96,7 +102,9 @@ Implemented behavior:
 - One acknowledgement comment per accepted command.
 - One queued Check Run per accepted command.
 - Deterministic run IDs in acknowledgement markers and Check Run `external_id` fields.
+- Hidden run-state metadata in PR comments for queued, running, completed, and failed states.
 - Duplicate webhook deliveries for the same comment command are treated idempotently.
+- New commands remain queued when GitHub comments indicate another run is already running for the PR.
 
 Domain foundations exist for future lifecycle states:
 - queued
@@ -125,12 +133,17 @@ else:
 
 Kiln does not run Devcontainer CLI today.
 
-### Kubernetes Execution
+### Execution
 
 Implemented behavior:
 - `disabled` mode acknowledges commands without launching jobs.
+- `local` mode runs `local_command` on the same host as Kiln without isolation.
 - `kubectl` mode renders a Kubernetes Job manifest and runs `kubectl apply -f -`.
-- Jobs receive run, repository, PR, requester, command, agent, model, queue, and runtime metadata as environment variables.
+- Local commands and Jobs receive run, repository, PR, requester, command, agent, model, queue, and runtime metadata as environment variables.
+- Jobs receive a per-run `KILN_CALLBACK_TOKEN` derived from Kiln's private callback key, not the private key itself.
+- Local execution is synchronous and advances the next queued run after completion.
+- Successful `kubectl` launches are non-terminal until the agent posts an authenticated callback to `/callbacks/agent`.
+- Completion callbacks mark runs `completed` or `failed`, then advance the next queued run for that PR.
 
 Not implemented:
 - Agent harness container behavior.

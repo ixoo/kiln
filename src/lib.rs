@@ -13,9 +13,10 @@ pub mod signature;
 pub use config::{ExecutionSettings, RuntimeConfig, Settings};
 pub use execution::{
     AgentJob, DisabledJobLauncher, JobLaunchError, JobLaunchResult, JobLauncher,
-    KubectlJobLauncher, PerPrQueue,
+    KubectlJobLauncher, LocalJobLauncher, PerPrQueue,
 };
 pub use github::{
-    CheckRunRequest, GitHubClient, GitHubContext, GitHubError, RealGitHubClient, RepoPermission,
+    CheckRunRequest, CheckRunUpdate, GitHubClient, GitHubContext, GitHubError, IssueComment,
+    RealGitHubClient, RepoPermission,
 };
 pub use server::build_app;

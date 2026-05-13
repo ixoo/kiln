@@ -128,6 +128,8 @@ mode = "disabled"
 namespace = "default"
 job_image = "ghcr.io/ixoo/kiln-agent:latest"
 default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
+# local_command = ["kiln-agent"]
+# callback_url = "https://<generated-host>/callbacks/agent"
 ```
 
 Create `~/.config/kiln-test/.env` with absolute paths:
@@ -136,6 +138,7 @@ Create `~/.config/kiln-test/.env` with absolute paths:
 KILN_CONFIG=/Users/<user>/.config/kiln-test/kiln.toml
 KILN_GITHUB_APP_ID=<app-id>
 KILN_GITHUB_WEBHOOK_SECRET=<app-webhook-secret>
+KILN_AGENT_CALLBACK_SECRET=<agent-callback-secret>
 KILN_GITHUB_PRIVATE_KEY_PATH=/Users/<user>/.config/kiln-test/keys/kiln-test.private-key.pem
 RUST_LOG=kiln=info
 ```

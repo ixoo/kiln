@@ -14,8 +14,10 @@ Implemented core foundations:
 - maintainer permission checks.
 - acknowledgement comments and Check Runs.
 - local simulated HTTP tests.
+- optional local process launch with no isolation.
 - optional Kubernetes Job launch through `kubectl`.
-- per-PR in-memory launch serialization.
+- authenticated completion callbacks from asynchronous agents.
+- GitHub-backed per-PR queue state with in-memory critical sections for race prevention.
 - runtime detection helpers.
 - audit trailer helpers.
 - recovery helpers for missing/stale run classification.

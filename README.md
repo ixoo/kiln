@@ -1,10 +1,11 @@
 # Kiln
 
-Kiln is a Git-native agent orchestrator. It accepts `/agent` commands on pull request issue comments, validates policy, acknowledges accepted work with a PR comment plus a Check Run, and can hand accepted runs to a Kubernetes Job launcher.
+Kiln is a Git-native agent orchestrator. It accepts `/agent` commands on pull request issue comments, validates policy, acknowledges accepted work with a PR comment plus a Check Run, and can hand accepted runs to a local process or Kubernetes Job launcher.
 
 ## Current Scope
 
 - `POST /webhooks/github` for GitHub webhook delivery.
+- `POST /callbacks/agent` for authenticated agent completion callbacks.
 - `GET /healthz` for health checks.
 - GitHub webhook signature verification with `X-Hub-Signature-256`.
 - `/agent` command parsing from line-start commands only.
@@ -12,8 +13,11 @@ Kiln is a Git-native agent orchestrator. It accepts `/agent` commands on pull re
 - Maintainer-level permission enforcement: `write`, `maintain`, or `admin`.
 - Deterministic `kiln_<hash>` run IDs for idempotency.
 - One Check Run per accepted command.
-- In-memory per-PR serialization around accepted command handling and job launch.
+- GitHub-backed per-PR queue state using signed hidden run metadata in GitHub App-authored PR comments.
+- In-memory per-PR critical sections to prevent same-process launch races.
+- Optional local process execution mode with no isolation.
 - Optional `kubectl` Kubernetes Job launch mode.
+- Kubernetes agent completion callbacks that mark runs terminal and advance the next queued run.
 - Runtime detection helpers for `.devcontainer/devcontainer.json` versus fallback images.
 - Audit metadata helpers for future commit trailers.
 - Recovery helpers for missing/stale run classification.
@@ -61,9 +65,38 @@ mode = "disabled"
 namespace = "default"
 job_image = "ghcr.io/ixoo/kiln-agent:latest"
 default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
+launch_timeout_seconds = 300
+stale_run_seconds = 3600
+# local_command = ["kiln-agent"]
+# callback_url = "https://kiln.example.com/callbacks/agent"
 ```
 
-Set `[execution].mode` to `kubectl` only in an environment where the Kiln process can run `kubectl apply -f -` against the target cluster. Unknown execution modes fail startup. The generated Job receives run metadata, repository/PR metadata, command text, opaque agent/model values, and the configured fallback runtime image as environment variables.
+Set `[execution].mode` to `local` for the simplest execution path. Local mode runs `local_command` on the same host as Kiln, without isolation, and passes run metadata through `KILN_*` environment variables. This is useful for development or trusted single-host deployments, but it is not the recommended isolation boundary.
+
+Set `[execution].mode` to `kubectl` only in an environment where the Kiln process can run `kubectl apply -f -` against the target cluster. Configure `[execution].callback_url` and `KILN_AGENT_CALLBACK_SECRET`; kubectl mode fails startup without them so launched Jobs can complete through authenticated callbacks. Unknown execution modes fail startup. Local commands and generated Kubernetes Jobs receive run metadata, repository/PR metadata, command text, opaque agent/model values, callback metadata, and the configured fallback runtime image as environment variables. `launch_timeout_seconds` bounds local process and kubectl launch calls; `stale_run_seconds` lets Kiln fail stale running jobs and advance the per-PR queue.
+
+Agents report completion with:
+
+```http
+POST /callbacks/agent
+X-Kiln-Callback-Token: <KILN_CALLBACK_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "run_id": "kiln_...",
+  "status": "completed",
+  "owner": "octo",
+  "repo": "repo",
+  "repo_full_name": "octo/repo",
+  "pr_number": 42,
+  "installation_id": 999,
+  "detail": "optional human-readable detail"
+}
+```
+
+Use `"status": "failed"` to mark a run failed. `KILN_CALLBACK_TOKEN` is unique to the run and derived from Kiln's private callback key; the shared callback key is never passed to agents. A successful callback updates GitHub-backed run state and advances the next queued run for the PR.
 
 The binary reads these environment variables:
 
@@ -71,6 +104,7 @@ The binary reads these environment variables:
 - `KILN_CONFIG`: path to the TOML config file. Defaults to `config/kiln.toml`.
 - `KILN_GITHUB_APP_ID`: numeric GitHub App ID.
 - `KILN_GITHUB_WEBHOOK_SECRET`: webhook secret configured on the GitHub App.
+- `KILN_AGENT_CALLBACK_SECRET`: private key used by Kiln to derive per-run callback tokens.
 - `KILN_GITHUB_PRIVATE_KEY_PATH`: path to the GitHub App private key PEM.
 - `RUST_LOG`: optional tracing filter.
 
@@ -101,7 +135,8 @@ See `docs/integration-testing.md` for the reusable manual GitHub App test setup.
 
 ## Current Boundaries
 
-- The default execution mode is disabled; Kubernetes launch requires explicit config.
+- The default execution mode is disabled; local and Kubernetes execution require explicit config.
+- Local execution has no sandbox and runs with the Kiln process user's host permissions.
 - Kiln generates runtime job metadata, but the agent harness container is not implemented in this repository yet.
 - Kiln detects devcontainer intent in helper code, but does not run Devcontainer CLI itself.
 - Model routing and agent/model validation belong to the agent harness.
