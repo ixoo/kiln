@@ -130,6 +130,7 @@ job_image = "ghcr.io/ixoo/kiln-agent:latest"
 default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
 # local_command = ["kiln-agent"]
 # callback_url = "https://<generated-host>/callbacks/agent"
+# job_env_from_secret = "kiln-opencode-agent"
 ```
 
 Create `~/.config/kiln-test/.env` with absolute paths:
@@ -138,6 +139,8 @@ Create `~/.config/kiln-test/.env` with absolute paths:
 KILN_CONFIG=/Users/<user>/.config/kiln-test/kiln.toml
 KILN_GITHUB_APP_ID=<app-id>
 KILN_GITHUB_WEBHOOK_SECRET=<app-webhook-secret>
+KILN_STATE_SECRET=<state-marker-secret>
+KILN_PREVIOUS_STATE_SECRETS=
 KILN_AGENT_CALLBACK_SECRET=<agent-callback-secret>
 KILN_GITHUB_PRIVATE_KEY_PATH=/Users/<user>/.config/kiln-test/keys/kiln-test.private-key.pem
 RUST_LOG=kiln=info
@@ -200,3 +203,5 @@ For later manual runs with the same app and repo:
 4. Comment `/agent ping` on the existing test PR or open a new PR.
 
 Cloudflare Quick Tunnel URLs are temporary. For automated recurring integration tests, use a stable HTTPS deployment or a named Cloudflare tunnel, then store the GitHub App credentials in a secret manager or CI secrets. Do not add those credentials to this repository.
+
+For a real OpenCode agent smoke test, use `docs/opencode-agent.md` after this GitHub App setup works in `disabled` mode.

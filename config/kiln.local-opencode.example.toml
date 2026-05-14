@@ -1,0 +1,8 @@
+[server]
+bind_address = "127.0.0.1:3000"
+
+[execution]
+mode = "local"
+local_command = ["/bin/sh", "examples/opencode/local-agent.sh", "/absolute/path/to/opencode-agent.env"]
+launch_timeout_seconds = 1800
+stale_run_seconds = 3600

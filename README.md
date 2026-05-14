@@ -135,6 +135,16 @@ A tunnel is only needed if you want GitHub.com to send webhooks to a process run
 
 See `docs/integration-testing.md` for the reusable manual GitHub App test setup.
 
+## OpenCode Agent Example
+
+Kiln includes runnable examples for using OpenCode as a real agent in both local and Kubernetes execution modes. The examples run `opencode run`, post the output back to the PR, and let Kiln manage queue state and Check Runs.
+
+Start here:
+
+```text
+docs/opencode-agent.md
+```
+
 ## Current Boundaries
 
 - The default execution mode is disabled; local and Kubernetes execution require explicit config.

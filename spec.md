@@ -141,7 +141,7 @@ Implemented behavior:
 - `kubectl` mode renders a Kubernetes Job manifest and runs `kubectl apply -f -`.
 - Local commands and Jobs receive run, repository, PR, requester, command, agent, model, queue, and runtime metadata as environment variables.
 - Jobs receive a per-run `KILN_CALLBACK_TOKEN` derived from Kiln's private callback key, not the private key itself.
-- Local execution is synchronous and advances the next queued run after completion.
+- Queue advancement is scheduled asynchronously after command acknowledgement and completion callbacks.
 - Successful `kubectl` launches are non-terminal until the agent posts an authenticated callback to `/callbacks/agent`.
 - Completion callbacks mark runs `completed` or `failed`, then advance the next queued run for that PR.
 

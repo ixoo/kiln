@@ -298,7 +298,20 @@ struct KubernetesPodSpec<'a> {
 struct KubernetesContainer<'a> {
     name: &'a str,
     image: &'a str,
+    #[serde(rename = "envFrom", skip_serializing_if = "Vec::is_empty")]
+    env_from: Vec<KubernetesEnvFrom<'a>>,
     env: Vec<KubernetesEnvVar>,
+}
+
+#[derive(Debug, Serialize)]
+struct KubernetesEnvFrom<'a> {
+    #[serde(rename = "secretRef")]
+    secret_ref: KubernetesSecretRef<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct KubernetesSecretRef<'a> {
+    name: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,6 +344,7 @@ pub fn kubernetes_job_manifest(
                     containers: vec![KubernetesContainer {
                         name: "agent",
                         image: &settings.job_image,
+                        env_from: job_env_from(settings),
                         env: job_env(settings, job),
                     }],
                 },
@@ -346,6 +360,18 @@ fn job_env(settings: &ExecutionSettings, job: &AgentJob) -> Vec<KubernetesEnvVar
         .into_iter()
         .map(|(name, value)| env_var(name, value))
         .collect()
+}
+
+fn job_env_from(settings: &ExecutionSettings) -> Vec<KubernetesEnvFrom<'_>> {
+    settings
+        .job_env_from_secret
+        .as_deref()
+        .map(|secret| {
+            vec![KubernetesEnvFrom {
+                secret_ref: KubernetesSecretRef { name: secret },
+            }]
+        })
+        .unwrap_or_default()
 }
 
 pub fn job_env_vars(settings: &ExecutionSettings, job: &AgentJob) -> Vec<(&'static str, String)> {
@@ -458,6 +484,7 @@ mod tests {
             job_image: "ghcr.io/ixoo/kiln-agent:latest".to_string(),
             default_runtime_image: "ghcr.io/ixoo/kiln-runtime:latest".to_string(),
             service_account_name: Some("kiln-agent".to_string()),
+            job_env_from_secret: None,
             local_command: Vec::new(),
             callback_url: None,
             callback_secret: None,
@@ -502,6 +529,17 @@ mod tests {
         assert!(manifest.contains("KILN_CALLBACK_TOKEN"));
         assert!(!manifest.contains("KILN_CALLBACK_SECRET"));
         assert!(manifest.contains("/agent:coder:local fix tests"));
+    }
+
+    #[test]
+    fn renders_kubernetes_job_env_from_secret() {
+        let mut settings = settings();
+        settings.job_env_from_secret = Some("kiln-opencode-agent".to_string());
+        let manifest = kubernetes_job_manifest(&settings, &job()).unwrap();
+
+        assert!(manifest.contains("\"envFrom\""));
+        assert!(manifest.contains("\"secretRef\""));
+        assert!(manifest.contains("\"name\": \"kiln-opencode-agent\""));
     }
 
     #[test]

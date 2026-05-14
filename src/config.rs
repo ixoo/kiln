@@ -26,6 +26,8 @@ pub struct ExecutionSettings {
     #[serde(default)]
     pub service_account_name: Option<String>,
     #[serde(default)]
+    pub job_env_from_secret: Option<String>,
+    #[serde(default)]
     pub local_command: Vec<String>,
     #[serde(default)]
     pub callback_url: Option<String>,
@@ -45,6 +47,7 @@ impl Default for ExecutionSettings {
             job_image: default_job_image(),
             default_runtime_image: default_runtime_image(),
             service_account_name: None,
+            job_env_from_secret: None,
             local_command: Vec::new(),
             callback_url: None,
             callback_secret: None,

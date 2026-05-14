@@ -12,5 +12,6 @@ default_runtime_image = "ghcr.io/devcontainers/base:ubuntu"
 # local_command = ["kiln-agent"]
 # callback_url = "https://kiln.example.com/callbacks/agent"
 # service_account_name = "kiln-agent"
+# job_env_from_secret = "kiln-opencode-agent"
 launch_timeout_seconds = 300
 stale_run_seconds = 3600

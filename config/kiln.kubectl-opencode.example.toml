@@ -1,0 +1,11 @@
+[server]
+bind_address = "0.0.0.0:3000"
+
+[execution]
+mode = "kubectl"
+namespace = "default"
+job_image = "ghcr.io/<owner>/kiln-opencode-agent:latest"
+job_env_from_secret = "kiln-opencode-agent"
+callback_url = "https://kiln.example.com/callbacks/agent"
+launch_timeout_seconds = 300
+stale_run_seconds = 3600
