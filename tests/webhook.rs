@@ -139,6 +139,10 @@ impl MockGitHubClient {
     fn fail_next_comment(&self) {
         self.inner.lock().unwrap().fail_next_comment = true;
     }
+
+    fn set_head_sha(&self, head_sha: impl Into<String>) {
+        self.inner.lock().unwrap().head_sha = head_sha.into();
+    }
 }
 
 #[async_trait]
@@ -178,7 +182,7 @@ impl GitHubClient for MockGitHubClient {
         &self,
         _ctx: &GitHubContext,
         body: &str,
-    ) -> Result<(), GitHubError> {
+    ) -> Result<IssueComment, GitHubError> {
         let mut inner = self.inner.lock().unwrap();
         if inner.fail_next_comment {
             inner.fail_next_comment = false;
@@ -197,7 +201,11 @@ impl GitHubClient for MockGitHubClient {
             body: body.to_string(),
             trusted: true,
         });
-        Ok(())
+        Ok(IssueComment {
+            id,
+            body: body.to_string(),
+            trusted: true,
+        })
     }
 
     async fn create_check_run(
@@ -266,7 +274,9 @@ async fn accepted_command_launches_agent_job() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_body = response_json(response).await;
-    assert_eq!(response_body["runs"][0]["launch_status"], "recorded");
+    assert_eq!(response_body["runs"][0]["launch_status"], "queued");
+
+    wait_until(|| launcher.jobs().len() == 1).await;
 
     let jobs = launcher.jobs();
     assert_eq!(jobs.len(), 1);
@@ -277,6 +287,7 @@ async fn accepted_command_launches_agent_job() {
     assert_eq!(jobs[0].command.agent.as_deref(), Some("coder"));
     assert_eq!(jobs[0].command.model.as_deref(), Some("local"));
 
+    wait_until(|| github.check_updates().len() == 2).await;
     let updates = github.check_updates();
     assert_eq!(updates.len(), 2);
     assert_eq!(updates[0].status, "in_progress");
@@ -303,6 +314,7 @@ async fn forged_queue_state_comment_is_ignored() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    wait_until(|| launcher.jobs().len() == 1).await;
     assert_eq!(launcher.jobs().len(), 1);
     assert_eq!(github.checks().len(), 1);
 }
@@ -323,6 +335,7 @@ async fn replayed_kiln_state_from_untrusted_comment_is_ignored() {
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
+    wait_until(|| launcher.jobs().len() == 1).await;
     let acknowledged_state = github.comments()[0].clone();
     github.add_comment(acknowledged_state);
 
@@ -378,12 +391,160 @@ async fn launch_failure_is_reported_without_retrying_webhook() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_body = response_json(response).await;
-    assert_eq!(response_body["runs"][0]["launch_status"], "launch-failed");
+    assert_eq!(response_body["runs"][0]["launch_status"], "queued");
 
+    wait_until(|| github.comments().len() == 3).await;
     let comments = github.comments();
     assert_eq!(comments.len(), 3);
     assert!(comments[1].contains("as `running`"));
     assert!(comments[2].contains("as `failed`"));
+    assert!(comments[2].contains("launch failed; see Kiln logs"));
+    assert!(!comments[2].contains("job launcher is disabled"));
+}
+
+#[tokio::test]
+async fn duplicate_malformed_command_rejection_is_idempotent() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let app = app(github.clone());
+    let body = payload_with_body("/agent:coder:local:extra fix tests");
+
+    let first = app
+        .clone()
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+    let second = app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(github.comments().len(), 1);
+    assert!(github.comments()[0].contains("kiln:rejection_id="));
+}
+
+#[tokio::test]
+async fn non_command_comment_does_not_advance_queue() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let disabled = app(github.clone());
+    let body = payload_with_body("/agent queued task");
+
+    let accepted = disabled
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let launcher = RecordingLauncher::nonterminal();
+    let launching_app = app_with_launcher(github, launcher.clone());
+    let ignored = launching_app
+        .oneshot(signed_request(
+            "issue_comment",
+            &payload_with_body_for_comment(1002, "plain comment"),
+            "test-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(ignored.status(), StatusCode::OK);
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(launcher.jobs().len(), 0);
+}
+
+#[tokio::test]
+async fn queued_run_fails_instead_of_launching_when_pr_head_changes() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let disabled = app(github.clone());
+    let body = payload_with_body("/agent queued task");
+
+    let accepted = disabled
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    github.set_head_sha("def456");
+    let launcher = RecordingLauncher::nonterminal();
+    let launching_app = app_with_launcher(github.clone(), launcher.clone());
+    let duplicate = launching_app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate.status(), StatusCode::OK);
+    wait_until(|| {
+        github
+            .comments()
+            .iter()
+            .any(|comment| comment.contains("PR head changed before launch"))
+    })
+    .await;
+    assert_eq!(launcher.jobs().len(), 0);
+    assert!(github
+        .check_updates()
+        .iter()
+        .any(|update| update.conclusion.as_deref() == Some("failure")));
+}
+
+#[tokio::test]
+async fn previous_state_secret_preserves_duplicate_detection_during_rotation() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let old_app = app_with_state_secrets(
+        github.clone(),
+        DisabledJobLauncher,
+        "old-state-secret",
+        Vec::new(),
+    );
+    let body = payload_with_body("/agent rotate safely");
+
+    let first = old_app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let new_app = app_with_state_secrets(
+        github.clone(),
+        DisabledJobLauncher,
+        "new-state-secret",
+        vec!["old-state-secret".to_string()],
+    );
+    let second = new_app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(github.comments().len(), 1);
+    assert_eq!(github.checks().len(), 1);
+}
+
+#[tokio::test]
+async fn launch_lease_prevents_two_workers_from_launching_same_queued_run() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let disabled = app(github.clone());
+    let body = payload_with_body("/agent one launch only");
+
+    let accepted = disabled
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let first_launcher = RecordingLauncher::nonterminal();
+    let second_launcher = RecordingLauncher::nonterminal();
+    let first_app = app_with_launcher(github.clone(), first_launcher.clone());
+    let second_app = app_with_launcher(github, second_launcher.clone());
+
+    let (first, second) = tokio::join!(
+        first_app.oneshot(signed_request("issue_comment", &body, "test-secret")),
+        second_app.oneshot(signed_request("issue_comment", &body, "test-secret")),
+    );
+
+    assert_eq!(first.unwrap().status(), StatusCode::OK);
+    assert_eq!(second.unwrap().status(), StatusCode::OK);
+    wait_until(|| first_launcher.jobs().len() + second_launcher.jobs().len() == 1).await;
 }
 
 #[tokio::test]
@@ -468,6 +629,7 @@ async fn second_command_stays_queued_when_pr_has_running_agent() {
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
+    wait_until(|| launcher.jobs().len() == 1).await;
 
     let second = app
         .oneshot(signed_request(
@@ -510,7 +672,7 @@ async fn stale_running_run_is_failed_and_queue_advances() {
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(launcher.jobs().len(), 1);
+    wait_until(|| launcher.jobs().len() == 1).await;
 
     sleep(Duration::from_millis(1100)).await;
 
@@ -524,7 +686,7 @@ async fn stale_running_run_is_failed_and_queue_advances() {
         .unwrap();
 
     assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(launcher.jobs().len(), 2);
+    wait_until(|| launcher.jobs().len() == 2).await;
     assert!(github
         .comments()
         .iter()
@@ -571,6 +733,7 @@ async fn agent_callback_completes_running_run_and_launches_next_queued_run() {
         .unwrap();
     let first_body = response_json(first).await;
     let first_run_id = first_body["runs"][0]["run_id"].as_str().unwrap();
+    wait_until(|| launcher.jobs().len() == 1).await;
 
     let second = app
         .clone()
@@ -595,8 +758,11 @@ async fn agent_callback_completes_running_run_and_launches_next_queued_run() {
     assert_eq!(callback.status(), StatusCode::OK);
     let callback_body = response_json(callback).await;
     assert_eq!(callback_body["run_status"], "completed");
-    assert_eq!(callback_body["launched"].as_array().unwrap().len(), 1);
+    assert!(callback_body["launched"]
+        .as_array()
+        .is_none_or(Vec::is_empty));
 
+    wait_until(|| launcher.jobs().len() == 2).await;
     let jobs = launcher.jobs();
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[1].command.raw, "/agent second task");
@@ -604,6 +770,46 @@ async fn agent_callback_completes_running_run_and_launches_next_queued_run() {
         .comments()
         .iter()
         .any(|comment| comment.contains("as `completed`")));
+}
+
+#[tokio::test]
+async fn agent_callback_detail_is_not_echoed_to_public_comments() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let launcher = RecordingLauncher::nonterminal();
+    let app = app_with_launcher(github.clone(), launcher.clone());
+
+    let first = app
+        .clone()
+        .oneshot(signed_request(
+            "issue_comment",
+            &payload_with_body("/agent protect details"),
+            "test-secret",
+        ))
+        .await
+        .unwrap();
+    let first_body = response_json(first).await;
+    let run_id = first_body["runs"][0]["run_id"].as_str().unwrap();
+    wait_until(|| launcher.jobs().len() == 1).await;
+
+    let mut payload = agent_callback_payload(run_id, "completed");
+    payload["detail"] = json!("secret-token-from-agent");
+    let callback = app
+        .oneshot(agent_callback_request(
+            payload,
+            &test_callback_token(run_id),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(callback.status(), StatusCode::OK);
+    assert!(!github
+        .comments()
+        .iter()
+        .any(|comment| comment.contains("secret-token-from-agent")));
+    assert!(github
+        .comments()
+        .iter()
+        .any(|comment| comment.contains("agent provided completion detail")));
 }
 
 #[tokio::test]
@@ -769,11 +975,44 @@ fn app_with_launcher_and_settings(
     launcher: impl JobLauncher + 'static,
     settings: Settings,
 ) -> axum::Router {
+    app_with_launcher_settings_and_state_secrets(
+        github,
+        launcher,
+        settings,
+        "state-secret",
+        Vec::new(),
+    )
+}
+
+fn app_with_state_secrets(
+    github: MockGitHubClient,
+    launcher: impl JobLauncher + 'static,
+    state_secret: &str,
+    previous_state_secrets: Vec<String>,
+) -> axum::Router {
+    app_with_launcher_settings_and_state_secrets(
+        github,
+        launcher,
+        settings(),
+        state_secret,
+        previous_state_secrets,
+    )
+}
+
+fn app_with_launcher_settings_and_state_secrets(
+    github: MockGitHubClient,
+    launcher: impl JobLauncher + 'static,
+    settings: Settings,
+    state_secret: &str,
+    previous_state_secrets: Vec<String>,
+) -> axum::Router {
     build_app(
         RuntimeConfig {
             settings,
             webhook_secret: "test-secret".to_string(),
             agent_callback_secret: Some("callback-secret".to_string()),
+            state_secret: state_secret.to_string(),
+            previous_state_secrets,
         },
         Arc::new(github),
         Arc::new(launcher),
@@ -854,6 +1093,18 @@ fn agent_callback_request(body: Value, secret: &str) -> Request<Body> {
 
 fn test_callback_token(run_id: &str) -> String {
     callback_token("callback-secret", run_id, "octo/repo", 42, 999)
+}
+
+async fn wait_until(mut predicate: impl FnMut() -> bool) {
+    for _ in 0..50 {
+        if predicate() {
+            return;
+        }
+
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(predicate());
 }
 
 async fn response_json(response: axum::response::Response) -> Value {

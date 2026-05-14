@@ -161,7 +161,7 @@ async fn agent_callback(
         installation_id: payload.installation_id,
     };
 
-    match handle_agent_callback(&state, &ctx, payload).await {
+    match handle_agent_callback(state.clone(), &ctx, payload).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(CallbackError::RunNotFound(run_id)) => (
             StatusCode::NOT_FOUND,
@@ -189,7 +189,7 @@ async fn agent_callback(
 }
 
 async fn handle_agent_callback(
-    state: &AppState,
+    state: Arc<AppState>,
     ctx: &GitHubContext,
     payload: AgentCallbackPayload,
 ) -> Result<CallbackResponse, CallbackError> {
@@ -199,7 +199,7 @@ async fn handle_agent_callback(
 
     let outcome = async {
         let comments = state.github.issue_comments(ctx).await?;
-        let records = queue_records(&comments, &state.config.webhook_secret);
+        let records = queue_records(&comments, &state.config);
         let Some(record) = records
             .into_iter()
             .find(|record| record.job.run_id == payload.run_id)
@@ -209,11 +209,10 @@ async fn handle_agent_callback(
 
         let terminal_status = payload.status.queue_status();
         if matches!(record.status, QueueStatus::Completed | QueueStatus::Failed) {
-            let launches = advance_queue(state, ctx).await?;
             return Ok(CallbackResponse::ok(
                 record.job.run_id,
                 record.status,
-                launches,
+                Vec::new(),
             ));
         }
 
@@ -224,6 +223,8 @@ async fn handle_agent_callback(
             });
         }
 
+        let public_detail = public_callback_detail(payload.detail.as_deref());
+
         state
             .github
             .create_issue_comment(
@@ -231,31 +232,33 @@ async fn handle_agent_callback(
                 &run_status_comment(
                     &record.job,
                     terminal_status,
-                    payload.detail.as_deref(),
-                    &state.config.webhook_secret,
+                    public_detail.as_deref(),
+                    &state.config.state_secret,
                 ),
             )
             .await?;
         update_check_run_for_status(
-            state,
+            &state,
             ctx,
             &record.job,
             terminal_status,
-            payload.detail.as_deref(),
+            public_detail.as_deref(),
         )
         .await?;
-        let launches = advance_queue(state, ctx).await?;
-
         Ok(CallbackResponse::ok(
             record.job.run_id,
             terminal_status,
-            launches,
+            Vec::new(),
         ))
     }
     .await;
 
     drop(queue_guard);
     state.queue.release_if_idle(&queue_key, &queue_lock).await;
+
+    if outcome.is_ok() && state.launcher.should_launch() {
+        schedule_advance_queue(state.clone(), ctx.clone());
+    }
 
     outcome
 }
@@ -292,15 +295,6 @@ async fn handle_issue_comment(
 
     let commands = extract_commands(&payload.comment.body);
     if commands.is_empty() {
-        if state.launcher.should_launch() {
-            let queue_key = queue_key(&ctx.repo_full_name, ctx.pr_number);
-            let queue_lock = state.queue.lock_for(&queue_key).await;
-            let queue_guard = queue_lock.lock().await;
-            let _ = advance_queue(&state, &ctx).await?;
-            drop(queue_guard);
-            state.queue.release_if_idle(&queue_key, &queue_lock).await;
-        }
-
         return Ok(WebhookResponse::ignored(
             "comment has no line-start /agent command",
         ));
@@ -312,7 +306,7 @@ async fn handle_issue_comment(
 
     for command_line in commands {
         let outcome = handle_command_line(
-            &state,
+            state.clone(),
             &payload,
             &ctx,
             &command_line,
@@ -332,38 +326,21 @@ async fn handle_issue_comment(
 }
 
 async fn handle_command_line(
-    state: &AppState,
+    state: Arc<AppState>,
     payload: &IssueCommentPayload,
     ctx: &GitHubContext,
     command_line: &CommandLine,
     permission: &mut Option<crate::github::RepoPermission>,
     head_sha: &mut Option<String>,
 ) -> Result<RunOutcome, crate::github::GitHubError> {
-    let command = match &command_line.parsed {
-        Ok(command) => command,
-        Err(reason) => {
-            let body = rejection_comment(command_line.line_number, &command_line.raw, reason);
-            state.github.create_issue_comment(ctx, &body).await?;
-            return Ok(RunOutcome::rejected(command_line, reason));
-        }
-    };
-
     let queue_key = queue_key(&ctx.repo_full_name, ctx.pr_number);
     let queue_lock = state.queue.lock_for(&queue_key).await;
     let queue_guard = queue_lock.lock().await;
+    let mut schedule_queue = false;
 
     let outcome = async {
-        let run_id = run_id(ctx, payload.comment.id, command);
         let comments = state.github.issue_comments(ctx).await?;
-        let records = queue_records(&comments, &state.config.webhook_secret);
-        if let Some(existing) = records.iter().find(|record| record.job.run_id == run_id) {
-            info!(%run_id, "skipping duplicate agent command");
-            ensure_check_run(state, ctx, &existing.job, existing.job.queue_position).await?;
-            if state.launcher.should_launch() {
-                advance_queue(state, ctx).await?;
-            }
-            return Ok(RunOutcome::duplicate(command, run_id));
-        }
+        let rejection_id = rejection_id(ctx, payload.comment.id, command_line);
 
         if permission.is_none() {
             *permission = Some(
@@ -374,14 +351,66 @@ async fn handle_command_line(
             );
         }
 
+        if !permission
+            .as_ref()
+            .expect("permission was fetched")
+            .can_invoke_agent()
+        {
+            let reason = "requester must have write, maintain, or admin permission";
+            create_rejection_once(
+                state.as_ref(),
+                ctx,
+                &comments,
+                &rejection_id,
+                command_line,
+                reason,
+            )
+            .await?;
+            return Ok(RunOutcome::rejected(command_line, reason));
+        }
+
+        let command = match &command_line.parsed {
+            Ok(command) => command,
+            Err(reason) => {
+                create_rejection_once(
+                    state.as_ref(),
+                    ctx,
+                    &comments,
+                    &rejection_id,
+                    command_line,
+                    reason,
+                )
+                .await?;
+                return Ok(RunOutcome::rejected(command_line, reason));
+            }
+        };
+
+        let run_id = run_id(ctx, payload.comment.id, command);
+        let records = queue_records(&comments, &state.config);
+        if let Some(existing) = records.iter().find(|record| record.job.run_id == run_id) {
+            info!(%run_id, "skipping duplicate agent command");
+            ensure_check_run(&state, ctx, &existing.job, existing.job.queue_position).await?;
+            if state.launcher.should_launch() {
+                schedule_queue = true;
+            }
+            return Ok(RunOutcome::duplicate(command, run_id));
+        }
+
         match state.policy.evaluate_invocation(
             permission.as_ref().expect("permission was fetched"),
             command,
         ) {
             PolicyDecision::Allow => {}
             PolicyDecision::Deny(reason) => {
-                let body = rejection_comment(command.line_number, &command.raw, &reason);
-                state.github.create_issue_comment(ctx, &body).await?;
+                create_rejection_once(
+                    state.as_ref(),
+                    ctx,
+                    &comments,
+                    &rejection_id,
+                    command_line,
+                    &reason,
+                )
+                .await?;
                 return Ok(RunOutcome::rejected_command(command, &reason));
             }
         }
@@ -407,42 +436,39 @@ async fn handle_command_line(
             command,
             queue_position,
         );
-        ensure_check_run(state, ctx, &job, queue_position).await?;
+        ensure_check_run(&state, ctx, &job, queue_position).await?;
 
         let acknowledgement = acknowledgement_comment(
             command,
             &run_id,
             queue_position,
             &job,
-            &state.config.webhook_secret,
+            &state.config.state_secret,
         );
         state
             .github
             .create_issue_comment(ctx, &acknowledgement)
             .await?;
 
-        let launches = if state.launcher.should_launch() {
-            advance_queue(state, ctx).await?
-        } else {
-            Vec::new()
-        };
-        let launch_status = launches
-            .iter()
-            .find(|launch| launch.run_id == run_id)
-            .map(|launch| launch.status.clone())
-            .unwrap_or_else(|| "queued".to_string());
+        if state.launcher.should_launch() {
+            schedule_queue = true;
+        }
 
         Ok(RunOutcome::accepted(
             command,
             run_id,
             queue_position,
-            launch_status,
+            "queued".to_string(),
         ))
     }
     .await;
 
     drop(queue_guard);
     state.queue.release_if_idle(&queue_key, &queue_lock).await;
+
+    if outcome.is_ok() && schedule_queue {
+        schedule_advance_queue(state.clone(), ctx.clone());
+    }
 
     outcome
 }
@@ -455,7 +481,7 @@ async fn advance_queue(
 
     loop {
         let comments = state.github.issue_comments(ctx).await?;
-        let records = queue_records(&comments, &state.config.webhook_secret);
+        let records = queue_records(&comments, &state.config);
 
         if let Some(running) = records
             .iter()
@@ -473,7 +499,7 @@ async fn advance_queue(
                         &running.job,
                         QueueStatus::Failed,
                         Some("run exceeded stale timeout"),
-                        &state.config.webhook_secret,
+                        &state.config.state_secret,
                     ),
                 )
                 .await?;
@@ -497,18 +523,50 @@ async fn advance_queue(
         };
 
         let job = next.job;
+        let current_head_sha = state.github.pull_request_head_sha(ctx).await?;
+        if current_head_sha != job.head_sha {
+            let detail =
+                "PR head changed before launch; request a new /agent run for the latest commit";
+            state
+                .github
+                .create_issue_comment(
+                    ctx,
+                    &run_status_comment(
+                        &job,
+                        QueueStatus::Failed,
+                        Some(detail),
+                        &state.config.state_secret,
+                    ),
+                )
+                .await?;
+            update_check_run_for_status(state, ctx, &job, QueueStatus::Failed, Some(detail))
+                .await?;
+            continue;
+        }
+
+        let lease_id = launch_lease_id(&job.run_id);
         state
             .github
             .create_issue_comment(
                 ctx,
-                &run_status_comment(
+                &run_status_comment_with_lease(
                     &job,
                     QueueStatus::Running,
                     None,
-                    &state.config.webhook_secret,
+                    Some(&lease_id),
+                    &state.config.state_secret,
                 ),
             )
             .await?;
+
+        let comments = state.github.issue_comments(ctx).await?;
+        if winning_running_lease(&comments, &state.config, &job.run_id).as_deref()
+            != Some(lease_id.as_str())
+        {
+            info!(run_id = %job.run_id, "another kiln worker won the launch lease");
+            return Ok(launches);
+        }
+
         update_check_run_for_status(state, ctx, &job, QueueStatus::Running, None).await?;
 
         match state.launcher.launch(job.clone()).await {
@@ -519,6 +577,7 @@ async fn advance_queue(
                 });
 
                 if result.terminal {
+                    let public_detail = public_launch_detail(&result.status);
                     state
                         .github
                         .create_issue_comment(
@@ -526,8 +585,8 @@ async fn advance_queue(
                             &run_status_comment(
                                 &job,
                                 QueueStatus::Completed,
-                                Some(&result.status),
-                                &state.config.webhook_secret,
+                                Some(&public_detail),
+                                &state.config.state_secret,
                             ),
                         )
                         .await?;
@@ -536,7 +595,7 @@ async fn advance_queue(
                         ctx,
                         &job,
                         QueueStatus::Completed,
-                        Some(&result.status),
+                        Some(&public_detail),
                     )
                     .await?;
                     continue;
@@ -546,6 +605,7 @@ async fn advance_queue(
             }
             Err(error) => {
                 warn!(run_id = %job.run_id, %error, "failed to launch agent job");
+                let public_detail = "launch failed; see Kiln logs";
                 launches.push(QueueLaunch {
                     run_id: job.run_id.clone(),
                     status: "launch-failed".to_string(),
@@ -557,8 +617,8 @@ async fn advance_queue(
                         &run_status_comment(
                             &job,
                             QueueStatus::Failed,
-                            Some(&error.to_string()),
-                            &state.config.webhook_secret,
+                            Some(public_detail),
+                            &state.config.state_secret,
                         ),
                     )
                     .await?;
@@ -567,7 +627,7 @@ async fn advance_queue(
                     ctx,
                     &job,
                     QueueStatus::Failed,
-                    Some(&error.to_string()),
+                    Some(public_detail),
                 )
                 .await?;
             }
@@ -646,6 +706,102 @@ fn ignored(reason: String) -> Response {
     (StatusCode::OK, Json(WebhookResponse::ignored(reason))).into_response()
 }
 
+fn schedule_advance_queue(state: Arc<AppState>, ctx: GitHubContext) {
+    tokio::spawn(async move {
+        let queue_key = queue_key(&ctx.repo_full_name, ctx.pr_number);
+        let queue_lock = state.queue.lock_for(&queue_key).await;
+        let queue_guard = queue_lock.lock().await;
+        let outcome = advance_queue(&state, &ctx).await;
+        drop(queue_guard);
+        state.queue.release_if_idle(&queue_key, &queue_lock).await;
+
+        if let Err(error) = outcome {
+            warn!(%error, repo = %ctx.repo_full_name, pr = ctx.pr_number, "failed to advance queue");
+        }
+    });
+}
+
+async fn create_rejection_once(
+    state: &AppState,
+    ctx: &GitHubContext,
+    comments: &[IssueComment],
+    rejection_id: &str,
+    command_line: &CommandLine,
+    reason: &str,
+) -> Result<(), crate::github::GitHubError> {
+    let marker = rejection_marker(rejection_id);
+    if comments
+        .iter()
+        .any(|comment| comment.trusted && comment.body.contains(&marker))
+    {
+        return Ok(());
+    }
+
+    let body = rejection_comment(&marker, command_line.line_number, &command_line.raw, reason);
+    state.github.create_issue_comment(ctx, &body).await?;
+    Ok(())
+}
+
+fn rejection_id(ctx: &GitHubContext, comment_id: u64, command_line: &CommandLine) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ctx.repo_full_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(ctx.pr_number.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(comment_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(command_line.command_index.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(command_line.raw.as_bytes());
+
+    let digest = hex::encode(hasher.finalize());
+    format!("kiln_reject_{}", &digest[..16])
+}
+
+fn rejection_marker(rejection_id: &str) -> String {
+    format!("<!-- kiln:rejection_id={rejection_id} -->")
+}
+
+fn accepted_state_secrets(config: &RuntimeConfig) -> Vec<&str> {
+    let mut secrets = Vec::with_capacity(config.previous_state_secrets.len() + 1);
+    secrets.push(config.state_secret.as_str());
+    secrets.extend(config.previous_state_secrets.iter().map(String::as_str));
+    secrets
+}
+
+fn launch_lease_id(run_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(run_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(std::process::id().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now_unix_nanos().to_string().as_bytes());
+
+    let digest = hex::encode(hasher.finalize());
+    format!("lease_{}", &digest[..16])
+}
+
+fn winning_running_lease(
+    comments: &[IssueComment],
+    config: &RuntimeConfig,
+    run_id: &str,
+) -> Option<String> {
+    comments
+        .iter()
+        .filter(|comment| comment.trusted)
+        .flat_map(|comment| run_states(&comment.body, config))
+        .find(|state| state.run_id == run_id && state.status == QueueStatus::Running)
+        .and_then(|state| state.lease_id)
+}
+
+fn public_launch_detail(_detail: &str) -> String {
+    "launch completed".to_string()
+}
+
+fn public_callback_detail(detail: Option<&str>) -> Option<String> {
+    detail.map(|_| "agent provided completion detail; see agent logs".to_string())
+}
+
 fn constant_time_token_eq(provided: Option<&str>, expected: &str) -> bool {
     let Some(provided) = provided else {
         return false;
@@ -677,11 +833,26 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
 }
 
+fn now_unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 fn markdown_inline_code(value: &str) -> String {
-    if value.contains('`') {
-        format!("`` {} ``", safe_markdown_text(value))
+    let value = safe_markdown_text(value);
+    let longest_backtick_run = value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let delimiter = "`".repeat(longest_backtick_run + 1);
+
+    if longest_backtick_run == 0 {
+        format!("{delimiter}{value}{delimiter}")
     } else {
-        format!("`{}`", safe_markdown_text(value))
+        format!("{delimiter} {value} {delimiter}")
     }
 }
 
@@ -719,7 +890,7 @@ fn acknowledgement_comment(
     format!(
         "{}\n{}\nKiln accepted {}.\n\nRun: `{}`\nAgent: {}\nModel: {}\nStatus: `queued`\nPer-PR queue: `{}`",
         run_marker(run_id),
-        run_state_marker(job, QueueStatus::Queued, state_secret),
+        run_state_marker(job, QueueStatus::Queued, None, state_secret),
         markdown_inline_code(&command.raw),
         run_id,
         markdown_inline_code(agent_label(command)),
@@ -736,9 +907,10 @@ fn model_label(command: &AgentCommand) -> &str {
     command.model.as_deref().unwrap_or("harness default")
 }
 
-fn rejection_comment(line_number: usize, raw: &str, reason: &str) -> String {
+fn rejection_comment(marker: &str, line_number: usize, raw: &str, reason: &str) -> String {
     format!(
-        "Kiln could not accept command on line {}: {}.\n\nReason: {}.",
+        "{}\nKiln could not accept command on line {}: {}.\n\nReason: {}.",
+        marker,
         line_number,
         markdown_inline_code(raw),
         safe_markdown_text(reason)
@@ -751,6 +923,16 @@ fn run_status_comment(
     detail: Option<&str>,
     state_secret: &str,
 ) -> String {
+    run_status_comment_with_lease(job, status, detail, None, state_secret)
+}
+
+fn run_status_comment_with_lease(
+    job: &AgentJob,
+    status: QueueStatus,
+    detail: Option<&str>,
+    lease_id: Option<&str>,
+    state_secret: &str,
+) -> String {
     let status_label = status.as_str();
     let detail = detail
         .map(|detail| format!("\nDetail: {}.", safe_markdown_text(detail)))
@@ -759,7 +941,7 @@ fn run_status_comment(
     format!(
         "{}\n{}\nKiln marked run `{}` as `{}` for {}.{}",
         run_marker(&job.run_id),
-        run_state_marker(job, status, state_secret),
+        run_state_marker(job, status, lease_id, state_secret),
         job.run_id,
         status_label,
         markdown_inline_code(&job.command.raw),
@@ -767,10 +949,16 @@ fn run_status_comment(
     )
 }
 
-fn run_state_marker(job: &AgentJob, status: QueueStatus, state_secret: &str) -> String {
+fn run_state_marker(
+    job: &AgentJob,
+    status: QueueStatus,
+    lease_id: Option<&str>,
+    state_secret: &str,
+) -> String {
     let state = RunStateMarker {
         run_id: job.run_id.clone(),
         status,
+        lease_id: lease_id.map(str::to_string),
         owner: job.owner.clone(),
         repo: job.repo.clone(),
         repo_full_name: job.repo_full_name.clone(),
@@ -794,7 +982,7 @@ fn run_state_marker(job: &AgentJob, status: QueueStatus, state_secret: &str) -> 
     format!("<!-- kiln:run_state={encoded};sig={signature} -->")
 }
 
-fn queue_records(comments: &[IssueComment], state_secret: &str) -> Vec<QueueRecord> {
+fn queue_records(comments: &[IssueComment], config: &RuntimeConfig) -> Vec<QueueRecord> {
     let mut records = HashMap::<String, QueueRecord>::new();
 
     for (index, comment) in comments.iter().enumerate() {
@@ -802,7 +990,7 @@ fn queue_records(comments: &[IssueComment], state_secret: &str) -> Vec<QueueReco
             continue;
         }
 
-        for state in run_states(&comment.body, state_secret) {
+        for state in run_states(&comment.body, config) {
             let run_id = state.run_id.clone();
             let status = state.status;
             let updated_at_unix = state.updated_at_unix;
@@ -827,19 +1015,22 @@ fn queue_records(comments: &[IssueComment], state_secret: &str) -> Vec<QueueReco
 
 fn run_states<'a>(
     body: &'a str,
-    state_secret: &'a str,
+    config: &'a RuntimeConfig,
 ) -> impl Iterator<Item = RunStateMarker> + 'a {
     body.lines()
-        .filter_map(move |line| parse_run_state_marker(line, state_secret))
+        .filter_map(move |line| parse_run_state_marker(line, config))
 }
 
-fn parse_run_state_marker(line: &str, state_secret: &str) -> Option<RunStateMarker> {
+fn parse_run_state_marker(line: &str, config: &RuntimeConfig) -> Option<RunStateMarker> {
     let marker = line
         .trim()
         .strip_prefix("<!-- kiln:run_state=")?
         .strip_suffix(" -->")?;
     let (encoded, signature) = marker.split_once(";sig=")?;
-    if !constant_time_token_eq(Some(signature), &marker_signature(state_secret, encoded)) {
+    if !accepted_state_secrets(config)
+        .iter()
+        .any(|secret| constant_time_token_eq(Some(signature), &marker_signature(secret, encoded)))
+    {
         return None;
     }
     let bytes = hex::decode(encoded).ok()?;
@@ -894,6 +1085,8 @@ impl QueueStatus {
 struct RunStateMarker {
     run_id: String,
     status: QueueStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_id: Option<String>,
     owner: String,
     repo: String,
     repo_full_name: String,

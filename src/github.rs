@@ -10,6 +10,7 @@ use std::{
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,8 @@ pub enum GitHubError {
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error("system clock is before unix epoch")]
     Clock,
+    #[error("failed to parse github timestamp: {0}")]
+    ParseTimestamp(#[from] time::error::Parse),
 }
 
 #[async_trait]
@@ -112,7 +115,7 @@ pub trait GitHubClient: Send + Sync {
         &self,
         ctx: &GitHubContext,
         body: &str,
-    ) -> Result<(), GitHubError>;
+    ) -> Result<IssueComment, GitHubError>;
 
     async fn create_check_run(
         &self,
@@ -201,11 +204,15 @@ impl RealGitHubClient {
         let response = ensure_success(response).await?;
         let token = response.json::<InstallationToken>().await?;
         let token_value = token.token;
+        let expires_at_unix = OffsetDateTime::parse(&token.expires_at, &Rfc3339)?
+            .unix_timestamp()
+            .try_into()
+            .unwrap_or(now);
         self.token_cache.lock().await.insert(
             installation_id,
             CachedInstallationToken {
                 token: token_value.clone(),
-                expires_at_unix: now + 3000,
+                expires_at_unix,
             },
         );
         Ok(token_value)
@@ -275,18 +282,50 @@ impl RealGitHubClient {
         head_sha: &str,
         external_id: &str,
     ) -> Result<Option<u64>, GitHubError> {
-        let path = format!(
-            "/repos/{}/{}/commits/{}/check-runs?per_page=100",
-            ctx.owner, ctx.repo, head_sha
-        );
-        let response = self.get_with_installation_token(ctx, &path).await?;
-        let response = response.json::<CheckRunsResponse>().await?;
+        let mut page = 1;
+        loop {
+            let path = format!(
+                "/repos/{}/{}/commits/{}/check-runs?per_page=100&page={page}",
+                ctx.owner, ctx.repo, head_sha
+            );
+            let response = self.get_with_installation_token(ctx, &path).await?;
+            let response = response.json::<CheckRunsResponse>().await?;
 
-        Ok(response
-            .check_runs
-            .into_iter()
-            .find(|check| check.external_id.as_deref() == Some(external_id))
-            .map(|check| check.id))
+            if let Some(check) = response
+                .check_runs
+                .iter()
+                .find(|check| check.external_id.as_deref() == Some(external_id))
+            {
+                return Ok(Some(check.id));
+            }
+
+            if response.check_runs.len() < 100 {
+                return Ok(None);
+            }
+
+            page += 1;
+        }
+    }
+
+    async fn create_check_run_with_status(
+        &self,
+        ctx: &GitHubContext,
+        request: CheckRunPost<'_>,
+    ) -> Result<(), GitHubError> {
+        let path = format!("/repos/{}/{}/check-runs", ctx.owner, ctx.repo);
+        let body = CreateCheckRunBody {
+            name: request.name,
+            head_sha: request.head_sha,
+            status: request.status,
+            conclusion: request.conclusion,
+            external_id: request.external_id,
+            output: CheckRunOutput {
+                title: request.name,
+                summary: request.summary,
+            },
+        };
+        self.post_with_installation_token(ctx, &path, &body).await?;
+        Ok(())
     }
 }
 
@@ -372,14 +411,23 @@ impl GitHubClient for RealGitHubClient {
         &self,
         ctx: &GitHubContext,
         body: &str,
-    ) -> Result<(), GitHubError> {
+    ) -> Result<IssueComment, GitHubError> {
         let path = format!(
             "/repos/{}/{}/issues/{}/comments",
             ctx.owner, ctx.repo, ctx.pr_number
         );
-        self.post_with_installation_token(ctx, &path, &CreateCommentBody { body })
+        let response = self
+            .post_with_installation_token(ctx, &path, &CreateCommentBody { body })
             .await?;
-        Ok(())
+        let comment = response.json::<IssueCommentResponse>().await?;
+        Ok(IssueComment {
+            id: comment.id,
+            body: comment.body,
+            trusted: comment
+                .performed_via_github_app
+                .as_ref()
+                .is_some_and(|app| app.id == self.app_id),
+        })
     }
 
     async fn create_check_run(
@@ -387,19 +435,18 @@ impl GitHubClient for RealGitHubClient {
         ctx: &GitHubContext,
         request: CheckRunRequest,
     ) -> Result<(), GitHubError> {
-        let path = format!("/repos/{}/{}/check-runs", ctx.owner, ctx.repo);
-        let body = CreateCheckRunBody {
-            name: &request.name,
-            head_sha: &request.head_sha,
-            status: "queued",
-            external_id: &request.external_id,
-            output: CheckRunOutput {
-                title: &request.name,
+        self.create_check_run_with_status(
+            ctx,
+            CheckRunPost {
+                name: &request.name,
+                head_sha: &request.head_sha,
+                external_id: &request.external_id,
+                status: "queued",
+                conclusion: None,
                 summary: &request.summary,
             },
-        };
-        self.post_with_installation_token(ctx, &path, &body).await?;
-        Ok(())
+        )
+        .await
     }
 
     async fn update_check_run(
@@ -411,7 +458,19 @@ impl GitHubClient for RealGitHubClient {
             .find_check_run_id(ctx, &update.head_sha, &update.external_id)
             .await?
         else {
-            return Ok(());
+            return self
+                .create_check_run_with_status(
+                    ctx,
+                    CheckRunPost {
+                        name: &format!("kiln/recovered ({})", update.external_id),
+                        head_sha: &update.head_sha,
+                        external_id: &update.external_id,
+                        status: &update.status,
+                        conclusion: update.conclusion.as_deref(),
+                        summary: &update.summary,
+                    },
+                )
+                .await;
         };
 
         let path = format!(
@@ -462,6 +521,7 @@ struct AppClaims {
 #[derive(Debug, Deserialize)]
 struct InstallationToken {
     token: String,
+    expires_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -508,8 +568,19 @@ struct CreateCheckRunBody<'a> {
     name: &'a str,
     head_sha: &'a str,
     status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conclusion: Option<&'a str>,
     external_id: &'a str,
     output: CheckRunOutput<'a>,
+}
+
+struct CheckRunPost<'a> {
+    name: &'a str,
+    head_sha: &'a str,
+    external_id: &'a str,
+    status: &'a str,
+    conclusion: Option<&'a str>,
+    summary: &'a str,
 }
 
 #[derive(Debug, Serialize)]

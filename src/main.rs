@@ -19,6 +19,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_address = settings.server.bind_address.parse::<SocketAddr>()?;
     let webhook_secret = env::var("KILN_GITHUB_WEBHOOK_SECRET")?;
     let agent_callback_secret = env::var("KILN_AGENT_CALLBACK_SECRET").ok();
+    let state_secret = env::var("KILN_STATE_SECRET")?;
+    let previous_state_secrets = env::var("KILN_PREVIOUS_STATE_SECRETS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|secret| !secret.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     settings.execution.callback_secret = agent_callback_secret.clone();
     let app_id = env::var("KILN_GITHUB_APP_ID")?.parse::<u64>()?;
     let private_key_path = env::var("KILN_GITHUB_PRIVATE_KEY_PATH")?;
@@ -30,6 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             settings,
             webhook_secret,
             agent_callback_secret,
+            state_secret,
+            previous_state_secrets,
         },
         github,
         launcher,

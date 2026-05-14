@@ -104,6 +104,8 @@ The binary reads these environment variables:
 - `KILN_CONFIG`: path to the TOML config file. Defaults to `config/kiln.toml`.
 - `KILN_GITHUB_APP_ID`: numeric GitHub App ID.
 - `KILN_GITHUB_WEBHOOK_SECRET`: webhook secret configured on the GitHub App.
+- `KILN_STATE_SECRET`: private key used to sign GitHub-backed queue state markers.
+- `KILN_PREVIOUS_STATE_SECRETS`: optional comma-separated previous state marker keys accepted during rotation.
 - `KILN_AGENT_CALLBACK_SECRET`: private key used by Kiln to derive per-run callback tokens.
 - `KILN_GITHUB_PRIVATE_KEY_PATH`: path to the GitHub App private key PEM.
 - `RUST_LOG`: optional tracing filter.

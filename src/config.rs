@@ -59,6 +59,8 @@ pub struct RuntimeConfig {
     pub settings: Settings,
     pub webhook_secret: String,
     pub agent_callback_secret: Option<String>,
+    pub state_secret: String,
+    pub previous_state_secrets: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
