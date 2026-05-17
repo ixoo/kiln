@@ -31,7 +31,6 @@ Not implemented in Kiln today:
 - Devcontainer CLI execution.
 - Model inference, model routing, or model authorization.
 - Commit creation or push-back to PR branches.
-- Lifecycle Check Run updates beyond the initial queued run.
 - Startup reconciliation, webhook redelivery automation, or comment scanning.
 - GitLab support.
 
@@ -156,7 +155,7 @@ Remaining, when needed:
 - Startup reconciliation loop.
 - Recent comment scanning.
 - Webhook redelivery guidance or automation.
-- Stale Check Run update behavior.
+- Startup reconciliation for runs that became stale while Kiln was not running.
 
 Constraint:
 - Reconciliation must use GitHub as the source of truth and must not introduce a database.

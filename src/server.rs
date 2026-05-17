@@ -300,29 +300,46 @@ async fn handle_issue_comment(
         ));
     }
 
-    let mut outcomes = Vec::new();
     let mut permission = None;
     let mut head_sha = None;
+    let queue_key = queue_key(&ctx.repo_full_name, ctx.pr_number);
+    let queue_lock = state.queue.lock_for(&queue_key).await;
+    let queue_guard = queue_lock.lock().await;
+    let mut schedule_queue = false;
 
-    for command_line in commands {
-        let outcome = handle_command_line(
-            state.clone(),
-            &payload,
-            &ctx,
-            &command_line,
-            &mut permission,
-            &mut head_sha,
-        )
-        .await?;
-        outcomes.push(outcome);
+    let result = async {
+        let mut outcomes = Vec::new();
+        for command_line in commands {
+            let (outcome, command_schedule_queue) = handle_command_line(
+                state.clone(),
+                &payload,
+                &ctx,
+                &command_line,
+                &mut permission,
+                &mut head_sha,
+            )
+            .await?;
+            schedule_queue |= command_schedule_queue;
+            outcomes.push(outcome);
+        }
+
+        Ok::<_, crate::github::GitHubError>(WebhookResponse {
+            status: "ok".to_string(),
+            ignored: false,
+            reason: None,
+            runs: outcomes,
+        })
+    }
+    .await;
+
+    drop(queue_guard);
+    state.queue.release_if_idle(&queue_key, &queue_lock).await;
+
+    if result.is_ok() && schedule_queue {
+        schedule_advance_queue(state.clone(), ctx.clone());
     }
 
-    Ok(WebhookResponse {
-        status: "ok".to_string(),
-        ignored: false,
-        reason: None,
-        runs: outcomes,
-    })
+    result
 }
 
 async fn handle_command_line(
@@ -332,31 +349,42 @@ async fn handle_command_line(
     command_line: &CommandLine,
     permission: &mut Option<crate::github::RepoPermission>,
     head_sha: &mut Option<String>,
-) -> Result<RunOutcome, crate::github::GitHubError> {
-    let queue_key = queue_key(&ctx.repo_full_name, ctx.pr_number);
-    let queue_lock = state.queue.lock_for(&queue_key).await;
-    let queue_guard = queue_lock.lock().await;
+) -> Result<(RunOutcome, bool), crate::github::GitHubError> {
     let mut schedule_queue = false;
 
-    let outcome = async {
-        let comments = state.github.issue_comments(ctx).await?;
-        let rejection_id = rejection_id(ctx, payload.comment.id, command_line);
+    let comments = state.github.issue_comments(ctx).await?;
+    let rejection_id = rejection_id(ctx, payload.comment.id, command_line);
 
-        if permission.is_none() {
-            *permission = Some(
-                state
-                    .github
-                    .user_permission(ctx, &payload.sender.login)
-                    .await?,
-            );
-        }
+    if permission.is_none() {
+        *permission = Some(
+            state
+                .github
+                .user_permission(ctx, &payload.sender.login)
+                .await?,
+        );
+    }
 
-        if !permission
-            .as_ref()
-            .expect("permission was fetched")
-            .can_invoke_agent()
-        {
-            let reason = "requester must have write, maintain, or admin permission";
+    if !permission
+        .as_ref()
+        .expect("permission was fetched")
+        .can_invoke_agent()
+    {
+        let reason = "requester must have write, maintain, or admin permission";
+        create_rejection_once(
+            state.as_ref(),
+            ctx,
+            &comments,
+            &rejection_id,
+            command_line,
+            reason,
+        )
+        .await?;
+        return Ok((RunOutcome::rejected(command_line, reason), false));
+    }
+
+    let command = match &command_line.parsed {
+        Ok(command) => command,
+        Err(reason) => {
             create_rejection_once(
                 state.as_ref(),
                 ctx,
@@ -366,111 +394,86 @@ async fn handle_command_line(
                 reason,
             )
             .await?;
-            return Ok(RunOutcome::rejected(command_line, reason));
+            return Ok((RunOutcome::rejected(command_line, reason), false));
         }
+    };
 
-        let command = match &command_line.parsed {
-            Ok(command) => command,
-            Err(reason) => {
-                create_rejection_once(
-                    state.as_ref(),
-                    ctx,
-                    &comments,
-                    &rejection_id,
-                    command_line,
-                    reason,
-                )
-                .await?;
-                return Ok(RunOutcome::rejected(command_line, reason));
-            }
-        };
-
-        let run_id = run_id(ctx, payload.comment.id, command);
-        let records = queue_records(&comments, &state.config);
-        if let Some(existing) = records.iter().find(|record| record.job.run_id == run_id) {
-            info!(%run_id, "skipping duplicate agent command");
-            ensure_check_run(&state, ctx, &existing.job, existing.job.queue_position).await?;
-            if state.launcher.should_launch() {
-                schedule_queue = true;
-            }
-            return Ok(RunOutcome::duplicate(command, run_id));
-        }
-
-        match state.policy.evaluate_invocation(
-            permission.as_ref().expect("permission was fetched"),
-            command,
-        ) {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny(reason) => {
-                create_rejection_once(
-                    state.as_ref(),
-                    ctx,
-                    &comments,
-                    &rejection_id,
-                    command_line,
-                    &reason,
-                )
-                .await?;
-                return Ok(RunOutcome::rejected_command(command, &reason));
-            }
-        }
-
-        if head_sha.is_none() {
-            *head_sha = Some(state.github.pull_request_head_sha(ctx).await?);
-        }
-
-        let queue_position = records
-            .iter()
-            .filter(|record| !record.status.is_terminal())
-            .count()
-            + 1;
-        let head_sha = head_sha
-            .as_ref()
-            .expect("head sha was just fetched")
-            .clone();
-        let job = AgentJob::new(
-            &run_id,
-            ctx,
-            head_sha.clone(),
-            &payload.sender.login,
-            command,
-            queue_position,
-        );
-        ensure_check_run(&state, ctx, &job, queue_position).await?;
-
-        let acknowledgement = acknowledgement_comment(
-            command,
-            &run_id,
-            queue_position,
-            &job,
-            &state.config.state_secret,
-        );
-        state
-            .github
-            .create_issue_comment(ctx, &acknowledgement)
-            .await?;
-
+    let run_id = run_id(ctx, payload.comment.id, command);
+    let records = queue_records(&comments, &state.config);
+    if let Some(existing) = records.iter().find(|record| record.job.run_id == run_id) {
+        info!(%run_id, "skipping duplicate agent command");
+        ensure_check_run(&state, ctx, &existing.job, existing.job.queue_position).await?;
         if state.launcher.should_launch() {
             schedule_queue = true;
         }
-
-        Ok(RunOutcome::accepted(
-            command,
-            run_id,
-            queue_position,
-            "queued".to_string(),
-        ))
-    }
-    .await;
-
-    drop(queue_guard);
-    state.queue.release_if_idle(&queue_key, &queue_lock).await;
-
-    if outcome.is_ok() && schedule_queue {
-        schedule_advance_queue(state.clone(), ctx.clone());
+        return Ok((
+            RunOutcome::duplicate(command, run_id, existing.job.queue_position),
+            schedule_queue,
+        ));
     }
 
-    outcome
+    match state.policy.evaluate_invocation(
+        permission.as_ref().expect("permission was fetched"),
+        command,
+    ) {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny(reason) => {
+            create_rejection_once(
+                state.as_ref(),
+                ctx,
+                &comments,
+                &rejection_id,
+                command_line,
+                &reason,
+            )
+            .await?;
+            return Ok((RunOutcome::rejected_command(command, &reason), false));
+        }
+    }
+
+    if head_sha.is_none() {
+        *head_sha = Some(state.github.pull_request_head_sha(ctx).await?);
+    }
+
+    let queue_position = records
+        .iter()
+        .filter(|record| !record.status.is_terminal())
+        .count()
+        + 1;
+    let head_sha = head_sha
+        .as_ref()
+        .expect("head sha was just fetched")
+        .clone();
+    let job = AgentJob::new(
+        &run_id,
+        ctx,
+        head_sha.clone(),
+        &payload.sender.login,
+        command,
+        queue_position,
+    );
+    ensure_check_run(&state, ctx, &job, queue_position).await?;
+
+    let acknowledgement = acknowledgement_comment(
+        command,
+        &run_id,
+        queue_position,
+        &job,
+        &state.config.state_secret,
+    );
+    state
+        .github
+        .create_issue_comment(ctx, &acknowledgement)
+        .await?;
+
+    if state.launcher.should_launch() {
+        schedule_queue = true;
+    }
+
+    Ok((
+        RunOutcome::accepted(command, run_id, queue_position, "queued".to_string()),
+        schedule_queue,
+    ))
 }
 
 async fn advance_queue(
@@ -574,6 +577,7 @@ async fn advance_queue(
                 launches.push(QueueLaunch {
                     run_id: job.run_id.clone(),
                     status: result.status.clone(),
+                    terminal: result.terminal,
                 });
 
                 if result.terminal {
@@ -609,6 +613,7 @@ async fn advance_queue(
                 launches.push(QueueLaunch {
                     run_id: job.run_id.clone(),
                     status: "launch-failed".to_string(),
+                    terminal: true,
                 });
                 state
                     .github
@@ -715,9 +720,28 @@ fn schedule_advance_queue(state: Arc<AppState>, ctx: GitHubContext) {
         drop(queue_guard);
         state.queue.release_if_idle(&queue_key, &queue_lock).await;
 
-        if let Err(error) = outcome {
-            warn!(%error, repo = %ctx.repo_full_name, pr = ctx.pr_number, "failed to advance queue");
+        match outcome {
+            Ok(launches) if launches.iter().any(|launch| !launch.terminal) => {
+                schedule_stale_wakeup(state.clone(), ctx.clone());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, repo = %ctx.repo_full_name, pr = ctx.pr_number, "failed to advance queue");
+            }
         }
+    });
+}
+
+fn schedule_stale_wakeup(state: Arc<AppState>, ctx: GitHubContext) {
+    tokio::spawn(async move {
+        let delay = state
+            .config
+            .settings
+            .execution
+            .stale_run_seconds
+            .saturating_add(1);
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        schedule_advance_queue(state, ctx);
     });
 }
 
@@ -994,6 +1018,12 @@ fn queue_records(comments: &[IssueComment], config: &RuntimeConfig) -> Vec<Queue
             let run_id = state.run_id.clone();
             let status = state.status;
             let updated_at_unix = state.updated_at_unix;
+            if records
+                .get(&run_id)
+                .is_some_and(|record| record.status.is_terminal())
+            {
+                continue;
+            }
             let first_seen = records
                 .get(&run_id)
                 .map(|record| record.first_seen)
@@ -1041,6 +1071,7 @@ fn parse_run_state_marker(line: &str, config: &RuntimeConfig) -> Option<RunState
 struct QueueLaunch {
     run_id: String,
     status: String,
+    terminal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1281,13 +1312,13 @@ impl RunOutcome {
         }
     }
 
-    fn duplicate(command: &AgentCommand, run_id: String) -> Self {
+    fn duplicate(command: &AgentCommand, run_id: String, queue_position: usize) -> Self {
         Self {
             status: "duplicate".to_string(),
             run_id: Some(run_id),
             command: command.raw.clone(),
             line_number: command.line_number,
-            queue_position: command.command_index + 1,
+            queue_position,
             launch_status: None,
             reason: Some("run already exists".to_string()),
         }

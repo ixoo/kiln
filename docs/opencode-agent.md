@@ -71,12 +71,12 @@ KILN_WORK_ROOT=/tmp/kiln-opencode-runs
 cp config/kiln.local-opencode.example.toml "$HOME/.config/kiln-opencode/kiln.toml"
 ```
 
-5. Edit `local_command` in `$HOME/.config/kiln-opencode/kiln.toml` so the env file path is absolute:
+5. Edit `local_command` in `$HOME/.config/kiln-opencode/kiln.toml` so paths are absolute, or start Kiln from the repository root so `examples/opencode/local-agent.sh` resolves correctly:
 
 ```toml
 [execution]
 mode = "local"
-local_command = ["/bin/sh", "examples/opencode/local-agent.sh", "/Users/<user>/.config/kiln-opencode/opencode-agent.env"]
+local_command = ["/bin/sh", "/Users/<user>/Projects/kiln/examples/opencode/local-agent.sh", "/Users/<user>/.config/kiln-opencode/opencode-agent.env"]
 launch_timeout_seconds = 1800
 stale_run_seconds = 3600
 ```
@@ -198,6 +198,8 @@ Expected result:
 - The Job posts an OpenCode output comment to the PR.
 - The Job calls `POST /callbacks/agent`, and Kiln marks the Check Run completed or failed.
 
+If the Job cannot clone, fetch, check out, comment, or run OpenCode, the example still attempts a failure callback so Kiln can mark the run failed. Inspect Kubernetes Job logs when a callback is not visible in the PR.
+
 ## Agent Environment
 
 Kiln passes these variables to local commands and Kubernetes Jobs:
@@ -226,3 +228,4 @@ Kiln passes these variables to local commands and Kubernetes Jobs:
 - If PR commenting fails, verify `GITHUB_TOKEN` can write issue or pull request comments.
 - If Kubernetes Jobs launch but stay running forever, check that `callback_url` is reachable from the cluster and that `KILN_AGENT_CALLBACK_SECRET` is set on Kiln.
 - If local mode cannot find `git`, `gh`, or `opencode`, set `PATH` correctly in `examples/opencode/local.env.example` after copying it.
+- The examples post OpenCode output back to the PR. Review token scopes and repository sensitivity before using them outside a throwaway or trusted repository.

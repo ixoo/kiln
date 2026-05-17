@@ -50,6 +50,8 @@ gh pr create --repo <owner>/<repo> --base main --head kiln-e2e-smoke --title "Ki
 openssl rand -hex 32
 ```
 
+Use the same command to generate `KILN_STATE_SECRET` and `KILN_AGENT_CALLBACK_SECRET` values for the local env file later.
+
 4. Start a Cloudflare Quick Tunnel:
 
 ```sh

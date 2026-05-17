@@ -8,6 +8,47 @@ export PATH HOME
 repo_url="https://github.com/${KILN_REPOSITORY}.git"
 worktree="/work/${KILN_RUN_ID}/repo"
 output_file="/work/${KILN_RUN_ID}/opencode-output.md"
+callback_sent=0
+state="failed"
+detail="agent exited before completion"
+askpass=""
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+send_callback() {
+  if [ "$callback_sent" -eq 1 ]; then
+    return 0
+  fi
+
+  if [ "${KILN_CALLBACK_URL:-}" = "" ] || [ "${KILN_CALLBACK_TOKEN:-}" = "" ]; then
+    return 0
+  fi
+
+  escaped_detail=$(json_escape "$detail")
+  if curl -fsS \
+    -X POST "$KILN_CALLBACK_URL" \
+    -H "Content-Type: application/json" \
+    -H "X-Kiln-Callback-Token: ${KILN_CALLBACK_TOKEN}" \
+    --data "{\"run_id\":\"${KILN_RUN_ID}\",\"status\":\"${state}\",\"owner\":\"${KILN_REPOSITORY_OWNER}\",\"repo\":\"${KILN_REPOSITORY_NAME}\",\"repo_full_name\":\"${KILN_REPOSITORY}\",\"pr_number\":${KILN_PR_NUMBER},\"installation_id\":${KILN_GITHUB_INSTALLATION_ID},\"detail\":\"${escaped_detail}\"}"; then
+    callback_sent=1
+  else
+    printf 'warning: failed to post Kiln callback\n' >&2
+  fi
+}
+
+on_exit() {
+  exit_status=$?
+  if [ "$askpass" != "" ]; then
+    rm -f "$askpass"
+  fi
+  if [ "$callback_sent" -eq 0 ]; then
+    send_callback || true
+  fi
+  exit "$exit_status"
+}
+trap on_exit EXIT
 
 mkdir -p "$(dirname "$worktree")"
 
@@ -23,7 +64,6 @@ case "$1" in
 esac
 ASKPASS
   export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
-  trap 'rm -f "$askpass"' EXIT INT TERM
 fi
 
 git clone --quiet --no-tags --depth 1 "$repo_url" "$worktree"
@@ -56,7 +96,11 @@ else
   fi
 fi
 
-if [ -f "$output_file" ] && [ "${GITHUB_TOKEN:-}" != "" ]; then
+if [ ! -f "$output_file" ]; then
+  printf '%s\n' "$detail" >"$output_file"
+fi
+
+if [ "${GITHUB_TOKEN:-}" != "" ]; then
   {
     printf 'Kiln OpenCode run `%s` %s.\n\n' "$KILN_RUN_ID" "$state"
     printf 'Command: `%s`\n\n' "$KILN_COMMAND"
@@ -67,17 +111,11 @@ if [ -f "$output_file" ] && [ "${GITHUB_TOKEN:-}" != "" ]; then
 
   GH_TOKEN="$GITHUB_TOKEN" gh pr comment "$KILN_PR_NUMBER" \
     --repo "$KILN_REPOSITORY" \
-    --body-file "${output_file}.comment"
+    --body-file "${output_file}.comment" || \
+    printf 'warning: failed to post OpenCode result comment\n' >&2
 fi
 
-if [ "${KILN_CALLBACK_URL:-}" != "" ] && [ "${KILN_CALLBACK_TOKEN:-}" != "" ]; then
-  escaped_detail=$(printf '%s' "$detail" | sed 's/\\/\\\\/g; s/"/\\"/g')
-  curl -fsS \
-    -X POST "$KILN_CALLBACK_URL" \
-    -H "Content-Type: application/json" \
-    -H "X-Kiln-Callback-Token: ${KILN_CALLBACK_TOKEN}" \
-    --data "{\"run_id\":\"${KILN_RUN_ID}\",\"status\":\"${state}\",\"owner\":\"${KILN_REPOSITORY_OWNER}\",\"repo\":\"${KILN_REPOSITORY_NAME}\",\"repo_full_name\":\"${KILN_REPOSITORY}\",\"pr_number\":${KILN_PR_NUMBER},\"installation_id\":${KILN_GITHUB_INSTALLATION_ID},\"detail\":\"${escaped_detail}\"}"
-fi
+send_callback
 
 if [ "$state" = "completed" ]; then
   exit 0

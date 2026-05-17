@@ -116,7 +116,7 @@ Domain foundations exist for future lifecycle states:
 - completed
 - failed
 
-Only initial queued Check Runs are created today.
+Check Runs are created as queued and updated to running, completed, or failed for the implemented execution modes.
 
 ### Runtime Metadata
 
@@ -174,7 +174,7 @@ Not implemented:
 - Startup reconciliation.
 - Recent comment scanning.
 - Webhook redelivery automation.
-- Stale Check Run updates.
+- Startup reconciliation for stale runs that existed before the process started.
 
 ### Provider Abstraction
 

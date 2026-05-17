@@ -82,6 +82,8 @@ pub enum ConfigError {
     MissingCallbackSecret,
     #[error("execution timeout values must be greater than zero")]
     InvalidTimeout,
+    #[error("{0} must be at least 16 characters and must not use example placeholder values")]
+    InvalidSecret(&'static str),
 }
 
 impl Settings {
@@ -110,6 +112,28 @@ impl ExecutionSettings {
             "local" => Ok(()),
             other => Err(ConfigError::InvalidExecutionMode(other.to_string())),
         }
+    }
+}
+
+pub fn validate_runtime_secrets(
+    webhook_secret: &str,
+    state_secret: &str,
+    agent_callback_secret: Option<&str>,
+) -> Result<(), ConfigError> {
+    validate_secret("KILN_GITHUB_WEBHOOK_SECRET", webhook_secret)?;
+    validate_secret("KILN_STATE_SECRET", state_secret)?;
+    if let Some(secret) = agent_callback_secret {
+        validate_secret("KILN_AGENT_CALLBACK_SECRET", secret)?;
+    }
+    Ok(())
+}
+
+fn validate_secret(name: &'static str, value: &str) -> Result<(), ConfigError> {
+    let value = value.trim();
+    if value.len() < 16 || value.contains("change-me") {
+        Err(ConfigError::InvalidSecret(name))
+    } else {
+        Ok(())
     }
 }
 
@@ -194,5 +218,25 @@ mod tests {
 
         execution.callback_secret = Some("secret".to_string());
         assert!(execution.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_short_and_placeholder_runtime_secrets() {
+        assert!(matches!(
+            validate_runtime_secrets("change-me", "long-enough-state-secret", None),
+            Err(ConfigError::InvalidSecret("KILN_GITHUB_WEBHOOK_SECRET"))
+        ));
+        assert!(matches!(
+            validate_runtime_secrets("long-enough-webhook-secret", "short", None),
+            Err(ConfigError::InvalidSecret("KILN_STATE_SECRET"))
+        ));
+        assert!(matches!(
+            validate_runtime_secrets(
+                "long-enough-webhook-secret",
+                "long-enough-state-secret",
+                Some("change-me-too")
+            ),
+            Err(ConfigError::InvalidSecret("KILN_AGENT_CALLBACK_SECRET"))
+        ));
     }
 }

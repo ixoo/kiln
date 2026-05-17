@@ -1,5 +1,6 @@
 use kiln::{
-    build_app, execution::launcher_from_settings, RealGitHubClient, RuntimeConfig, Settings,
+    build_app, config::validate_runtime_secrets, execution::launcher_from_settings,
+    RealGitHubClient, RuntimeConfig, Settings,
 };
 use std::{env, net::SocketAddr, sync::Arc};
 use tracing::info;
@@ -8,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(env_file) = env::var("KILN_ENV_FILE") {
-        dotenvy::from_path(env_file).ok();
+        dotenvy::from_path(env_file)?;
     } else {
         dotenvy::dotenv().ok();
     }
@@ -32,6 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or_default();
     settings.execution.callback_secret = agent_callback_secret.clone();
+    validate_runtime_secrets(
+        &webhook_secret,
+        &state_secret,
+        agent_callback_secret.as_deref(),
+    )?;
     let app_id = env::var("KILN_GITHUB_APP_ID")?.parse::<u64>()?;
     let private_key_path = env::var("KILN_GITHUB_PRIVATE_KEY_PATH")?;
 

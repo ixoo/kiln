@@ -9,7 +9,9 @@ fi
 # Kiln clears the inherited process environment in local mode. Source explicit
 # agent credentials and paths from a file outside the repository.
 # shellcheck disable=SC1090
+set -a
 . "$1"
+set +a
 
 PATH="${PATH:-/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin}"
 HOME="${HOME:-/tmp/kiln-opencode-home}"
@@ -45,19 +47,19 @@ git -C "$worktree" checkout --quiet --detach "$KILN_HEAD_SHA"
 agent="${KILN_AGENT:-build}"
 model="${KILN_MODEL:-${OPENCODE_MODEL:-}}"
 if [ "$model" = "" ]; then
-  printf 'KILN_MODEL or OPENCODE_MODEL must be set\n' >&2
-  exit 2
+  printf 'KILN_MODEL or OPENCODE_MODEL must be set\n' >"$output_file"
+  status=2
+else
+  set +e
+  opencode run \
+    --dir "$worktree" \
+    --agent "$agent" \
+    --model "$model" \
+    --title "Kiln ${KILN_RUN_ID}" \
+    "$KILN_TASK" >"$output_file" 2>&1
+  status=$?
+  set -e
 fi
-
-set +e
-opencode run \
-  --dir "$worktree" \
-  --agent "$agent" \
-  --model "$model" \
-  --title "Kiln ${KILN_RUN_ID}" \
-  "$KILN_TASK" >"$output_file" 2>&1
-status=$?
-set -e
 
 if [ "$status" -eq 0 ]; then
   state="completed"
@@ -76,7 +78,8 @@ fi
 if [ "${GITHUB_TOKEN:-}" != "" ]; then
   GH_TOKEN="$GITHUB_TOKEN" gh pr comment "$KILN_PR_NUMBER" \
     --repo "$KILN_REPOSITORY" \
-    --body-file "${output_file}.comment"
+    --body-file "${output_file}.comment" || \
+    printf 'warning: failed to post OpenCode result comment\n' >&2
 fi
 
 exit "$status"

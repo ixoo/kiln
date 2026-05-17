@@ -51,6 +51,7 @@ Run locally:
 ```sh
 cp config/kiln.example.toml config/kiln.toml
 cp .env.example .env
+# Edit .env with real GitHub App values and generated secrets before starting.
 cargo run
 ```
 
@@ -73,7 +74,7 @@ stale_run_seconds = 3600
 
 Set `[execution].mode` to `local` for the simplest execution path. Local mode runs `local_command` on the same host as Kiln, without isolation, and passes run metadata through `KILN_*` environment variables. This is useful for development or trusted single-host deployments, but it is not the recommended isolation boundary.
 
-Set `[execution].mode` to `kubectl` only in an environment where the Kiln process can run `kubectl apply -f -` against the target cluster. Configure `[execution].callback_url` and `KILN_AGENT_CALLBACK_SECRET`; kubectl mode fails startup without them so launched Jobs can complete through authenticated callbacks. Unknown execution modes fail startup. Local commands and generated Kubernetes Jobs receive run metadata, repository/PR metadata, command text, opaque agent/model values, callback metadata, and the configured fallback runtime image as environment variables. `launch_timeout_seconds` bounds local process and kubectl launch calls; `stale_run_seconds` lets Kiln fail stale running jobs and advance the per-PR queue.
+Set `[execution].mode` to `kubectl` only in an environment where the Kiln process can run `kubectl apply -f -` against the target cluster. Configure `[execution].callback_url` and `KILN_AGENT_CALLBACK_SECRET`; kubectl mode fails startup without them so launched Jobs can complete through authenticated callbacks. Unknown execution modes fail startup. Local commands and generated Kubernetes Jobs receive run metadata, repository/PR metadata, command text, opaque agent/model values, callback metadata, and the configured fallback runtime image as environment variables. `launch_timeout_seconds` bounds local process and kubectl launch calls; `stale_run_seconds` lets Kiln fail stale running jobs and advance the per-PR queue after a non-terminal launch or a later queue trigger.
 
 Agents report completion with:
 
@@ -109,6 +110,8 @@ The binary reads these environment variables:
 - `KILN_AGENT_CALLBACK_SECRET`: private key used by Kiln to derive per-run callback tokens.
 - `KILN_GITHUB_PRIVATE_KEY_PATH`: path to the GitHub App private key PEM.
 - `RUST_LOG`: optional tracing filter.
+
+Startup rejects empty, short, and example placeholder secret values. Generate webhook, state, and callback secrets with a command such as `openssl rand -hex 32`.
 
 ## Deployment
 

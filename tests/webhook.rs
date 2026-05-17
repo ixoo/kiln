@@ -614,6 +614,32 @@ async fn multiple_commands_are_queued_per_pr_in_order() {
 }
 
 #[tokio::test]
+async fn multiple_commands_launch_in_comment_order_with_fast_terminal_launcher() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let launcher = RecordingLauncher::new();
+    let app = app_with_launcher(github.clone(), launcher.clone());
+    let body = payload_with_body("/agent first task\n/agent second task");
+
+    let response = app
+        .oneshot(signed_request("issue_comment", &body, "test-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_until(|| launcher.jobs().len() == 2).await;
+
+    let jobs = launcher.jobs();
+    assert_eq!(jobs[0].command.raw, "/agent first task");
+    assert_eq!(jobs[0].queue_position, 1);
+    assert_eq!(jobs[1].command.raw, "/agent second task");
+    assert_eq!(jobs[1].queue_position, 2);
+
+    let comments = github.comments();
+    assert!(comments[0].contains("Per-PR queue: `1`"));
+    assert!(comments[1].contains("Per-PR queue: `2`"));
+}
+
+#[tokio::test]
 async fn second_command_stays_queued_when_pr_has_running_agent() {
     let github = MockGitHubClient::new(RepoPermission::Write);
     let launcher = RecordingLauncher::nonterminal();
@@ -691,6 +717,38 @@ async fn stale_running_run_is_failed_and_queue_advances() {
         .comments()
         .iter()
         .any(|comment| comment.contains("run exceeded stale timeout")));
+    assert!(github
+        .check_updates()
+        .iter()
+        .any(|update| update.conclusion.as_deref() == Some("failure")));
+}
+
+#[tokio::test]
+async fn stale_running_run_is_failed_without_another_webhook() {
+    let github = MockGitHubClient::new(RepoPermission::Write);
+    let launcher = RecordingLauncher::nonterminal();
+    let mut settings = settings();
+    settings.execution.stale_run_seconds = 1;
+    let app = app_with_launcher_and_settings(github.clone(), launcher.clone(), settings);
+
+    let response = app
+        .oneshot(signed_request(
+            "issue_comment",
+            &payload_with_body("/agent eventually stale"),
+            "test-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_until(|| launcher.jobs().len() == 1).await;
+
+    wait_until(|| {
+        github
+            .comments()
+            .iter()
+            .any(|comment| comment.contains("run exceeded stale timeout"))
+    })
+    .await;
     assert!(github
         .check_updates()
         .iter()
@@ -1096,7 +1154,7 @@ fn test_callback_token(run_id: &str) -> String {
 }
 
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
-    for _ in 0..50 {
+    for _ in 0..250 {
         if predicate() {
             return;
         }

@@ -18,8 +18,22 @@ pub struct CommandLine {
 
 pub fn extract_commands(body: &str) -> Vec<CommandLine> {
     let mut commands = Vec::new();
+    let mut fence = None;
 
     for (line_idx, line) in body.lines().enumerate() {
+        if let Some(marker) = markdown_fence_marker(line) {
+            if fence == Some(marker) {
+                fence = None;
+            } else if fence.is_none() {
+                fence = Some(marker);
+            }
+            continue;
+        }
+
+        if fence.is_some() {
+            continue;
+        }
+
         if !is_agent_command_line(line) {
             continue;
         }
@@ -38,6 +52,17 @@ pub fn extract_commands(body: &str) -> Vec<CommandLine> {
     }
 
     commands
+}
+
+fn markdown_fence_marker(line: &str) -> Option<char> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+        Some('`')
+    } else if trimmed.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
+    }
 }
 
 fn is_agent_command_line(line: &str) -> bool {
@@ -134,5 +159,15 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].raw, "/agent ping");
         assert_eq!(commands[1].raw, "/agent:reviewer review");
+    }
+
+    #[test]
+    fn ignores_commands_inside_markdown_fences() {
+        let commands = extract_commands(
+            "```text\n/agent do not run\n```\n/agent run this\n~~~\n/agent also ignored\n~~~",
+        );
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].raw, "/agent run this");
     }
 }
